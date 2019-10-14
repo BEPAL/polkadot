@@ -18,7 +18,7 @@
 
 use rstd::prelude::*;
 use sr_io::{keccak_256, secp256k1_ecdsa_recover};
-use srml_support::{StorageValue, StorageMap, decl_event, decl_storage, decl_module};
+use srml_support::{decl_event, decl_storage, decl_module};
 use srml_support::traits::{Currency, Get};
 use system::ensure_none;
 use codec::{Encode, Decode};
@@ -27,10 +27,12 @@ use serde::{self, Serialize, Deserialize, Serializer, Deserializer};
 #[cfg(feature = "std")]
 use sr_primitives::traits::Zero;
 use sr_primitives::{
-	weights::SimpleDispatchInfo,
-	traits::ValidateUnsigned,
-	transaction_validity::{TransactionLongevity, TransactionValidity, ValidTransaction},
+	weights::SimpleDispatchInfo, traits::ValidateUnsigned,
+	transaction_validity::{
+		TransactionLongevity, TransactionValidity, ValidTransaction, InvalidTransaction
+	},
 };
+use primitives::ValidityError;
 use system;
 
 type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::Balance;
@@ -115,7 +117,6 @@ decl_storage! {
 	}
 	add_extra_genesis {
 		config(claims): Vec<(EthereumAddress, BalanceOf<T>)>;
-
 	}
 }
 
@@ -125,7 +126,7 @@ decl_module! {
 		const Prefix: &[u8] = T::Prefix::get();
 
 		/// Deposit one of this module's events by using the default implementation.
-		fn deposit_event<T>() = default;
+		fn deposit_event() = default;
 
 		/// Make a claim.
 		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000)]
@@ -195,11 +196,6 @@ impl<T: Trait> ValidateUnsigned for Module<T> {
 	type Call = Call<T>;
 
 	fn validate_unsigned(call: &Self::Call) -> TransactionValidity {
-		// Note errors > 0 are from ApplyError
-		const INVALID_ETHEREUM_SIGNATURE: i8 = -10;
-		const SIGNER_HAS_NO_CLAIM: i8 = -20;
-		const INVALID_CALL: i8 = -30;
-
 		const PRIORITY: u64 = 100;
 
 		match call {
@@ -209,14 +205,18 @@ impl<T: Trait> ValidateUnsigned for Module<T> {
 				let signer = if let Some(s) = maybe_signer {
 					s
 				} else {
-					return TransactionValidity::Invalid(INVALID_ETHEREUM_SIGNATURE);
+					return InvalidTransaction::Custom(
+						ValidityError::InvalidEthereumSignature.into(),
+					).into();
 				};
 
 				if !<Claims<T>>::exists(&signer) {
-					return TransactionValidity::Invalid(SIGNER_HAS_NO_CLAIM);
+					return Err(InvalidTransaction::Custom(
+						ValidityError::SignerHasNoClaim.into(),
+					).into());
 				}
 
-				TransactionValidity::Valid(ValidTransaction {
+				Ok(ValidTransaction {
 					priority: PRIORITY,
 					requires: vec![],
 					provides: vec![("claims", signer).encode()],
@@ -224,7 +224,7 @@ impl<T: Trait> ValidateUnsigned for Module<T> {
 					propagate: true,
 				})
 			}
-			_ => TransactionValidity::Invalid(INVALID_CALL)
+			_ => Err(InvalidTransaction::Call.into()),
 		}
 	}
 }
@@ -236,8 +236,7 @@ mod tests {
 	use hex_literal::hex;
 	use super::*;
 
-	use sr_io::with_externalities;
-	use substrate_primitives::{H256, Blake2Hasher};
+	use substrate_primitives::H256;
 	use codec::Encode;
 	// The testing primitives are very useful for avoiding having to work with signatures
 	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are required.
@@ -347,7 +346,7 @@ mod tests {
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mockup.
-	fn new_test_ext() -> sr_io::TestExternalities<Blake2Hasher> {
+	fn new_test_ext() -> sr_io::TestExternalities {
 		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
 		// We use default for brevity, but you can configure as desired if needed.
 		balances::GenesisConfig::<Test>::default().assimilate_storage(&mut t).unwrap();
@@ -359,10 +358,10 @@ mod tests {
 
 	#[test]
 	fn basic_setup_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Claims::total(), 100);
 			assert_eq!(Claims::claims(&alice_eth()), Some(100));
-			assert_eq!(Claims::claims(&Default::default()), None);
+			assert_eq!(Claims::claims(&EthereumAddress::default()), None);
 		});
 	}
 
@@ -377,7 +376,7 @@ mod tests {
 
 	#[test]
 	fn claiming_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_ok!(Claims::claim(Origin::NONE, 42, alice_sig(&42u64.encode())));
 			assert_eq!(Balances::free_balance(&42), 100);
@@ -386,16 +385,18 @@ mod tests {
 
 	#[test]
 	fn origin_signed_claiming_fail() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Balances::free_balance(&42), 0);
-			assert_err!(Claims::claim(Origin::signed(42), 42, alice_sig(&42u64.encode())),
-				"bad origin: expected to be no origin");
+			assert_err!(
+				Claims::claim(Origin::signed(42), 42, alice_sig(&42u64.encode())),
+				"RequireNoOrigin",
+			);
 		});
 	}
 
 	#[test]
 	fn double_claiming_doesnt_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_ok!(Claims::claim(Origin::NONE, 42, alice_sig(&42u64.encode())));
 			assert_noop!(Claims::claim(Origin::NONE, 42, alice_sig(&42u64.encode())), "Ethereum address has no claim");
@@ -404,7 +405,7 @@ mod tests {
 
 	#[test]
 	fn non_sender_sig_doesnt_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_noop!(Claims::claim(Origin::NONE, 42, alice_sig(&69u64.encode())), "Ethereum address has no claim");
 		});
@@ -412,7 +413,7 @@ mod tests {
 
 	#[test]
 	fn non_claimant_doesnt_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_noop!(Claims::claim(Origin::NONE, 42, bob_sig(&69u64.encode())), "Ethereum address has no claim");
 		});
@@ -420,7 +421,7 @@ mod tests {
 
 	#[test]
 	fn real_eth_sig_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			// "Pay RUSTs to the TEST account:2a00000000000000"
 			let sig = hex!["444023e89b67e67c0562ed0305d252a5dd12b2af5ac51d6d3cb69a0b486bc4b3191401802dc29d26d586221f7256cd3329fe82174bdf659baea149a40e1c495d1c"];
 			let sig = EcdsaSignature(sig);
@@ -432,10 +433,10 @@ mod tests {
 
 	#[test]
 	fn validate_unsigned_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(
 				<Module<Test>>::validate_unsigned(&Call::claim(1, alice_sig(&1u64.encode()))),
-				TransactionValidity::Valid(ValidTransaction {
+				Ok(ValidTransaction {
 					priority: 100,
 					requires: vec![],
 					provides: vec![("claims", alice_eth()).encode()],
@@ -445,15 +446,15 @@ mod tests {
 			);
 			assert_eq!(
 				<Module<Test>>::validate_unsigned(&Call::claim(0, EcdsaSignature([0; 65]))),
-				TransactionValidity::Invalid(-10)
+				InvalidTransaction::Custom(ValidityError::InvalidEthereumSignature.into()).into(),
 			);
 			assert_eq!(
 				<Module<Test>>::validate_unsigned(&Call::claim(1, bob_sig(&1u64.encode()))),
-				TransactionValidity::Invalid(-20)
+				InvalidTransaction::Custom(ValidityError::SignerHasNoClaim.into()).into(),
 			);
 			assert_eq!(
 				<Module<Test>>::validate_unsigned(&Call::claim(0, bob_sig(&1u64.encode()))),
-				TransactionValidity::Invalid(-20)
+				InvalidTransaction::Custom(ValidityError::SignerHasNoClaim.into()).into(),
 			);
 		});
 	}

@@ -20,16 +20,17 @@ use primitives::{Pair, Public, crypto::UncheckedInto};
 use polkadot_primitives::{AccountId, parachain::ValidatorId};
 use polkadot_runtime::{
 	GenesisConfig, CouncilConfig, ElectionsConfig, DemocracyConfig, SystemConfig,
-	SessionConfig, StakingConfig, BalancesConfig, Perbill, SessionKeys, TechnicalCommitteeConfig,
+	SessionConfig, StakingConfig, BalancesConfig, SessionKeys, TechnicalCommitteeConfig,
 	SudoConfig, IndicesConfig, StakerStatus, WASM_BINARY,
-	ClaimsConfig, ParachainsConfig
+	ClaimsConfig, ParachainsConfig, RegistrarConfig
 };
 use polkadot_runtime::constants::{currency::DOTS, time::*};
+use sr_primitives::Perbill;
 use telemetry::TelemetryEndpoints;
 use hex_literal::hex;
 use babe_primitives::AuthorityId as BabeId;
 use grandpa::AuthorityId as GrandpaId;
-use im_online::AuthorityId as ImOnlineId;
+use im_online::sr25519::{AuthorityId as ImOnlineId};
 use srml_staking::Forcing;
 
 const STAGING_TELEMETRY_URL: &str = "wss://telemetry.polkadot.io/submit/";
@@ -147,8 +148,11 @@ fn staging_testnet_config_genesis() -> GenesisConfig {
 		babe: Some(Default::default()),
 		grandpa: Some(Default::default()),
 		im_online: Some(Default::default()),
+		authority_discovery: Some(Default::default()),
 		parachains: Some(ParachainsConfig {
 			authorities: vec![],
+		}),
+		registrar: Some(RegistrarConfig {
 			parachains: vec![],
 			_phdata: Default::default(),
 		}),
@@ -284,8 +288,11 @@ pub fn testnet_genesis(
 		babe: Some(Default::default()),
 		grandpa: Some(Default::default()),
 		im_online: Some(Default::default()),
+		authority_discovery: Some(Default::default()),
 		parachains: Some(ParachainsConfig {
 			authorities: vec![],
+		}),
+		registrar: Some(RegistrarConfig{
 			parachains: vec![],
 			_phdata: Default::default(),
 		}),

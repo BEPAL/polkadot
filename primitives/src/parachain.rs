@@ -30,7 +30,7 @@ use primitives::bytes;
 use application_crypto::KeyTypeId;
 
 pub use polkadot_parachain::{
-	Id, AccountIdConversion, ParachainDispatchOrigin, UpwardMessage,
+	Id, ParachainDispatchOrigin, LOWEST_USER_ID, UpwardMessage,
 };
 
 /// The key type ID for a collator key.
@@ -78,6 +78,67 @@ pub type ValidatorPair = validator_app::Pair;
 /// so we define it to be the same type as `SessionKey`. In the future it may have different crypto.
 pub type ValidatorSignature = validator_app::Signature;
 
+/// Retriability for a given active para.
+#[derive(Clone, Eq, PartialEq, Encode, Decode)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum Retriable {
+	/// Ineligible for retry. This means it's either a parachain which is always scheduled anyway or
+	/// has been removed/swapped.
+	Never,
+	/// Eligible for retry; the associated value is the number of retries that the para already had.
+	WithRetries(u32),
+}
+
+/// Type determining the active set of parachains in current block.
+pub trait ActiveParas {
+	/// Return the active set of parachains in current block. This attempts to keep any IDs in the
+	/// same place between sequential blocks. It is therefore unordered. The second item in the
+	/// tuple is the required collator ID, if any. If `Some`, then it is invalid to include any
+	/// other collator's block.
+	///
+	/// NOTE: The initial implementation simply concatenates the (ordered) set of (permanent)
+	/// parachain IDs with the (unordered) set of parathread IDs selected for this block.
+	fn active_paras() -> Vec<(Id, Option<(CollatorId, Retriable)>)>;
+}
+
+/// Description of how often/when this parachain is scheduled for progression.
+#[derive(Encode, Decode, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub enum Scheduling {
+	/// Scheduled every block.
+	Always,
+	/// Scheduled dynamically (i.e. a parathread).
+	Dynamic,
+}
+
+/// Information regarding a deployed parachain/thread.
+#[derive(Encode, Decode, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct Info {
+	/// Scheduling info.
+	pub scheduling: Scheduling,
+}
+
+/// An `Info` value for a standard leased parachain.
+pub const PARACHAIN_INFO: Info = Info {
+	scheduling: Scheduling::Always,
+};
+
+/// Auxilliary for when there's an attempt to swapped two parachains/parathreads.
+pub trait SwapAux {
+	/// Result describing whether it is possible to swap two parachains. Doesn't mutate state.
+	fn ensure_can_swap(one: Id, other: Id) -> Result<(), &'static str>;
+
+	/// Updates any needed state/references to enact a logical swap of two parachains. Identity,
+	/// code and head_data remain equivalent for all parachains/threads, however other properties
+	/// such as leases, deposits held and thread/chain nature are swapped.
+	///
+	/// May only be called on a state that `ensure_can_swap` has previously returned `Ok` for: if this is
+	/// not the case, the result is undefined. May only return an error if `ensure_can_swap` also returns
+	/// an error.
+	fn on_swap(one: Id, other: Id) -> Result<(), &'static str>;
+}
+
 /// Identifier for a chain, either one of a number of parachains or the relay chain.
 #[derive(Copy, Clone, PartialEq, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Debug))]
@@ -96,31 +157,37 @@ pub struct DutyRoster {
 	pub validator_duty: Vec<Chain>,
 }
 
-/// An outgoing message
+/// A message targeted to a specific parachain.
 #[derive(Clone, PartialEq, Eq, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
 #[cfg_attr(feature = "std", serde(deny_unknown_fields))]
-pub struct OutgoingMessage {
+pub struct TargetedMessage {
 	/// The target parachain.
 	pub target: Id,
 	/// The message data.
 	pub data: Vec<u8>,
 }
 
-impl PartialOrd for OutgoingMessage {
+impl AsRef<[u8]> for TargetedMessage {
+	fn as_ref(&self) -> &[u8] {
+		&self.data[..]
+	}
+}
+
+impl PartialOrd for TargetedMessage {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.target.cmp(&other.target))
 	}
 }
 
-impl Ord for OutgoingMessage {
+impl Ord for TargetedMessage {
 	fn cmp(&self, other: &Self) -> Ordering {
 		self.target.cmp(&other.target)
 	}
 }
 
-/// Extrinsic data for a parachain candidate.
+/// Outgoing message data for a parachain candidate.
 ///
 /// This is data produced by evaluating the candidate. It contains
 /// full records of all outgoing messages to other parachains.
@@ -128,11 +195,37 @@ impl Ord for OutgoingMessage {
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize, Debug))]
 #[cfg_attr(feature = "std", serde(rename_all = "camelCase"))]
 #[cfg_attr(feature = "std", serde(deny_unknown_fields))]
-pub struct Extrinsic {
+pub struct OutgoingMessages {
 	/// The outgoing messages from the execution of the parachain.
 	///
 	/// This must be sorted in ascending order by parachain ID.
-	pub outgoing_messages: Vec<OutgoingMessage>
+	pub outgoing_messages: Vec<TargetedMessage>
+}
+
+impl OutgoingMessages {
+	/// Returns an iterator of slices of all outgoing message queues.
+	///
+	/// All messages in a given slice are guaranteed to have the same target.
+	pub fn message_queues(&'_ self) -> impl Iterator<Item=&'_ [TargetedMessage]> + '_ {
+		let mut outgoing = &self.outgoing_messages[..];
+
+		rstd::iter::from_fn(move || {
+			if outgoing.is_empty() { return None }
+			let target = outgoing[0].target;
+			let mut end = 1; // the index of the last matching item + 1.
+			loop {
+				match outgoing.get(end) {
+					None => break,
+					Some(x) => if x.target != target { break },
+				}
+				end += 1;
+			}
+
+			let item = &outgoing[..end];
+			outgoing = &outgoing[end..];
+			Some(item)
+		})
+	}
 }
 
 /// Candidate receipt type.
@@ -216,6 +309,18 @@ pub struct PoVBlock {
 #[derive(PartialEq, Eq, Clone, Decode)]
 #[cfg_attr(feature = "std", derive(Serialize, Deserialize, Encode, Debug))]
 pub struct Message(#[cfg_attr(feature = "std", serde(with="bytes"))] pub Vec<u8>);
+
+impl AsRef<[u8]> for Message {
+	fn as_ref(&self) -> &[u8] {
+		&self.0[..]
+	}
+}
+
+impl From<TargetedMessage> for Message {
+	fn from(targeted: TargetedMessage) -> Self {
+		Message(targeted.data)
+	}
+}
 
 /// All ingress roots at one block.
 ///
@@ -388,14 +493,17 @@ substrate_client::decl_runtime_apis! {
 		/// Get the current duty roster.
 		fn duty_roster() -> DutyRoster;
 		/// Get the currently active parachains.
-		fn active_parachains() -> Vec<Id>;
+		fn active_parachains() -> Vec<(Id, Option<(CollatorId, Retriable)>)>;
 		/// Get the given parachain's status.
 		fn parachain_status(id: Id) -> Option<Status>;
 		/// Get the given parachain's head code blob.
 		fn parachain_code(id: Id) -> Option<Vec<u8>>;
 		/// Get all the unrouted ingress roots at the given block that
 		/// are targeting the given parachain.
-		fn ingress(to: Id) -> Option<StructuredUnroutedIngress>;
+		///
+		/// If `since` is provided, only messages since (including those in) that block
+		/// will be included.
+		fn ingress(to: Id, since: Option<BlockNumber>) -> Option<StructuredUnroutedIngress>;
 	}
 }
 
