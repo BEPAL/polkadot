@@ -32,7 +32,7 @@ use inherents::InherentDataProviders;
 use log::info;
 pub use service::{AbstractService, Roles, PruningMode, TransactionPoolOptions, Error};
 pub use service::{ServiceBuilderExport, ServiceBuilderImport, ServiceBuilderRevert};
-pub use service::config::full_version_from_strs;
+pub use service::config::{DatabaseConfig, full_version_from_strs};
 pub use client::{backend::Backend, runtime_api::{Core as CoreApi, ConstructRuntimeApi}, ExecutionStrategy, CallExecutor};
 pub use consensus_common::SelectChain;
 pub use polkadot_network::{PolkadotProtocol};
@@ -116,7 +116,7 @@ macro_rules! new_full_start {
 				import_setup = Some((block_import, grandpa_link, babe_link));
 				Ok(import_queue)
 			})?
-			.with_rpc_extensions(|client, pool| -> polkadot_rpc::RpcExtension {
+			.with_rpc_extensions(|client, pool, _backend| -> polkadot_rpc::RpcExtension {
 				polkadot_rpc::create(client, pool)
 			})?;
 
@@ -146,7 +146,11 @@ pub fn new_full(config: Configuration<CustomConfiguration, GenesisConfig>)
 	let is_authority = config.roles.is_authority() && !is_collator;
 	let force_authoring = config.force_authoring;
 	let max_block_data_size = config.custom.max_block_data_size;
-	let db_path = config.database_path.clone();
+	let db_path = if let DatabaseConfig::Path { ref path, .. } = config.database {
+		path.clone()
+	} else {
+		return Err("Starting a Polkadot service with a custom database isn't supported".to_string().into());
+	};
 	let disable_grandpa = config.disable_grandpa;
 	let name = config.name.clone();
 
@@ -370,7 +374,7 @@ pub fn new_light(config: Configuration<CustomConfiguration, GenesisConfig>)
 		.with_finality_proof_provider(|client, backend|
 			Ok(Arc::new(GrandpaFinalityProofProvider::new(backend, client)) as _)
 		)?
-		.with_rpc_extensions(|client, pool| -> polkadot_rpc::RpcExtension {
+		.with_rpc_extensions(|client, pool, _backend| -> polkadot_rpc::RpcExtension {
 			polkadot_rpc::create(client, pool)
 		})?
 		.build()
