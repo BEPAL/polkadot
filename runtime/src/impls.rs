@@ -17,17 +17,17 @@
 //! Auxillary struct/enums for polkadot runtime.
 
 use primitives::Balance;
-use sr_primitives::weights::Weight;
-use sr_primitives::traits::{Convert, Saturating};
-use sr_primitives::{Fixed64, Perbill};
-use srml_support::traits::{OnUnbalanced, Currency, Get};
+use sp_runtime::traits::{Convert, Saturating};
+use sp_runtime::{Fixed64, Perbill};
+use frame_support::weights::Weight;
+use frame_support::traits::{OnUnbalanced, Currency, Get};
 use crate::{Balances, System, Authorship, MaximumBlockWeight, NegativeImbalance};
 
 /// Logic for the author to get a portion of fees.
 pub struct ToAuthor;
 
 impl OnUnbalanced<NegativeImbalance> for ToAuthor {
-	fn on_unbalanced(amount: NegativeImbalance) {
+	fn on_nonzero_unbalanced(amount: NegativeImbalance) {
 		Balances::resolve_creating(&Authorship::author(), amount);
 	}
 }

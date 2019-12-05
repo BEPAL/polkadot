@@ -20,13 +20,12 @@ use rstd::prelude::*;
 use rstd::result;
 use rstd::collections::btree_map::BTreeMap;
 use codec::{Encode, Decode};
-use srml_support::{decl_storage, decl_module, ensure};
 
-use sr_primitives::traits::{
+use sp_runtime::traits::{
 	Hash as HashT, BlakeTwo256, Saturating, One, Zero, Dispatchable,
 	AccountIdConversion,
 };
-use sr_primitives::weights::SimpleDispatchInfo;
+use frame_support::weights::SimpleDispatchInfo;
 use primitives::{
 	Hash, Balance,
 	parachain::{
@@ -34,12 +33,12 @@ use primitives::{
 		UpwardMessage, BlockIngressRoots, ValidatorId, ActiveParas, CollatorId, Retriable
 	},
 };
-use srml_support::{
-	Parameter, dispatch::Result,
+use frame_support::{
+	Parameter, dispatch::Result, decl_storage, decl_module, ensure,
 	traits::{Currency, Get, WithdrawReason, ExistenceRequirement, Randomness},
 };
 
-use inherents::{ProvideInherent, InherentData, RuntimeString, MakeFatalError, InherentIdentifier};
+use inherents::{ProvideInherent, InherentData, MakeFatalError, InherentIdentifier};
 
 use system::ensure_none;
 use crate::attestations::{self, IncludedBlocks};
@@ -456,7 +455,7 @@ impl<T: Trait> Module<T> {
 				// same.
 				ordered_needs_dispatch.insert(i, id);
 			} else {
-				sr_primitives::print("ordered_needs_dispatch contains id?!");
+				sp_runtime::print("ordered_needs_dispatch contains id?!");
 			}
 		}
 	}
@@ -658,7 +657,7 @@ impl<T: Trait> Module<T> {
 	) -> rstd::result::Result<IncludedBlocks<T>, &'static str>
 	{
 		use primitives::parachain::ValidityAttestation;
-		use sr_primitives::traits::AppVerify;
+		use sp_runtime::traits::AppVerify;
 
 		// returns groups of slices that have the same chain ID.
 		// assumes the inner slice is sorted by id.
@@ -842,7 +841,7 @@ impl<T: Trait> Module<T> {
 */
 }
 
-impl<T: Trait> sr_primitives::BoundToRuntimeAppPublic for Module<T> {
+impl<T: Trait> sp_runtime::BoundToRuntimeAppPublic for Module<T> {
 	type Public = ValidatorId;
 }
 
@@ -874,7 +873,7 @@ pub type InherentType = Vec<AttestedCandidate>;
 
 impl<T: Trait> ProvideInherent for Module<T> {
 	type Call = Call<T>;
-	type Error = MakeFatalError<RuntimeString>;
+	type Error = MakeFatalError<inherents::Error>;
 	const INHERENT_IDENTIFIER: InherentIdentifier = NEW_HEADS_IDENTIFIER;
 
 	fn create_inherent(data: &InherentData) -> Option<Self::Call> {
@@ -902,10 +901,10 @@ mod tests {
 	use super::*;
 	use super::Call as ParachainsCall;
 	use bitvec::{bitvec, vec::BitVec};
-	use sr_io::TestExternalities;
-	use substrate_primitives::{H256, Blake2Hasher};
-	use substrate_trie::NodeCodec;
-	use sr_primitives::{
+	use sp_io::TestExternalities;
+	use sp_core::{H256, Blake2Hasher};
+	use sp_trie::NodeCodec;
+	use sp_runtime::{
 		Perbill, curve::PiecewiseLinear, testing::{UintAuthorityId, Header},
 		traits::{BlakeTwo256, IdentityLookup, OnInitialize, OnFinalize},
 	};
@@ -918,7 +917,7 @@ mod tests {
 	};
 	use crate::constants::time::*;
 	use keyring::Sr25519Keyring;
-	use srml_support::{
+	use frame_support::{
 		impl_outer_origin, impl_outer_dispatch, assert_ok, assert_err, parameter_types,
 	};
 	use crate::parachains;
@@ -1027,7 +1026,7 @@ mod tests {
 		type CreationFee = CreationFee;
 	}
 
-	srml_staking_reward_curve::build! {
+	pallet_staking_reward_curve::build! {
 		const REWARD_CURVE: PiecewiseLinear<'static> = curve!(
 			min_inflation: 0_025_000,
 			max_inflation: 0_100_000,
@@ -1039,14 +1038,15 @@ mod tests {
 	}
 
 	parameter_types! {
-		pub const SessionsPerEra: sr_staking_primitives::SessionIndex = 6;
+		pub const SessionsPerEra: sp_staking::SessionIndex = 6;
 		pub const BondingDuration: staking::EraIndex = 28;
+		pub const SlashDeferDuration: staking::EraIndex = 7;
 		pub const AttestationPeriod: BlockNumber = 100;
 		pub const RewardCurve: &'static PiecewiseLinear<'static> = &REWARD_CURVE;
 	}
 
 	impl staking::Trait for Test {
-		type OnRewardMinted = ();
+		type RewardRemainder = ();
 		type CurrencyToVote = ();
 		type Event = ();
 		type Currency = balances::Module<Test>;
@@ -1054,6 +1054,8 @@ mod tests {
 		type Reward = ();
 		type SessionsPerEra = SessionsPerEra;
 		type BondingDuration = BondingDuration;
+		type SlashDeferDuration = SlashDeferDuration;
+		type SlashCancelOrigin = system::EnsureRoot<Self::AccountId>;
 		type SessionInterface = Self;
 		type Time = timestamp::Module<Test>;
 		type RewardCurve = RewardCurve;
@@ -1245,6 +1247,7 @@ mod tests {
 				fees: 0,
 				block_data_hash: Default::default(),
 				upward_messages: vec![],
+				erasure_root: [1u8; 32].into(),
 			}
 		}
 	}
@@ -1267,6 +1270,7 @@ mod tests {
 				upward_messages: upward_messages.into_iter()
 					.map(|x| UpwardMessage { origin: x.0, data: x.1 })
 					.collect(),
+				erasure_root: [1u8; 32].into(),
 			}
 		}
 	}
@@ -1674,6 +1678,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				},
 
 			};
@@ -1705,6 +1710,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				}
 			};
 
@@ -1720,6 +1726,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				}
 			};
 
@@ -1759,6 +1766,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				}
 			};
 
@@ -1796,6 +1804,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				}
 			};
 
@@ -1841,6 +1850,7 @@ mod tests {
 						fees: 0,
 						block_data_hash: Default::default(),
 						upward_messages: vec![],
+						erasure_root: [1u8; 32].into(),
 					}
 				};
 
@@ -1857,6 +1867,7 @@ mod tests {
 						fees: 0,
 						block_data_hash: Default::default(),
 						upward_messages: vec![],
+						erasure_root: [1u8; 32].into(),
 					}
 				};
 
@@ -1918,6 +1929,7 @@ mod tests {
 					fees: 0,
 					block_data_hash: Default::default(),
 					upward_messages: vec![],
+					erasure_root: [1u8; 32].into(),
 				}
 			};
 			make_attestations(&mut candidate_c);
@@ -2036,7 +2048,7 @@ mod tests {
 
 	#[test]
 	fn empty_trie_root_const_is_blake2_hashed_null_node() {
-		let hashed_null_node =  <NodeCodec<Blake2Hasher> as trie_db::NodeCodec<Blake2Hasher>>::hashed_null_node();
+		let hashed_null_node = <NodeCodec<Blake2Hasher> as trie_db::NodeCodec>::hashed_null_node();
 		assert_eq!(hashed_null_node, EMPTY_TRIE_ROOT.into())
 	}
 }

@@ -19,10 +19,12 @@
 //! information for commissioning and decommissioning them.
 
 use rstd::{prelude::*, mem::swap, convert::TryInto};
-use sr_primitives::traits::{CheckedSub, StaticLookup, Zero, One, CheckedConversion, Hash, AccountIdConversion};
-use sr_primitives::weights::SimpleDispatchInfo;
+use sp_runtime::traits::{
+	CheckedSub, StaticLookup, Zero, One, CheckedConversion, Hash, AccountIdConversion,
+};
+use frame_support::weights::SimpleDispatchInfo;
 use codec::{Encode, Decode, Codec};
-use srml_support::{
+use frame_support::{
 	decl_module, decl_storage, decl_event, ensure,
 	traits::{Currency, ReservableCurrency, WithdrawReason, ExistenceRequirement, Get, Randomness},
 };
@@ -818,12 +820,12 @@ mod tests {
 	use super::*;
 	use std::{result::Result, collections::HashMap, cell::RefCell};
 
-	use substrate_primitives::H256;
-	use sr_primitives::{
+	use sp_core::H256;
+	use sp_runtime::{
 		Perbill, testing::Header,
 		traits::{BlakeTwo256, Hash, IdentityLookup, OnInitialize, OnFinalize},
 	};
-	use srml_support::{impl_outer_origin, parameter_types, assert_ok, assert_noop};
+	use frame_support::{impl_outer_origin, parameter_types, assert_ok, assert_noop};
 	use balances;
 	use primitives::parachain::{Id as ParaId, Info as ParaInfo};
 
@@ -946,7 +948,7 @@ mod tests {
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mock up.
-	fn new_test_ext() -> sr_io::TestExternalities {
+	fn new_test_ext() -> sp_io::TestExternalities {
 		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
 		balances::GenesisConfig::<Test>{
 			balances: vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],

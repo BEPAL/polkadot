@@ -22,7 +22,7 @@
 mod chain_spec;
 
 use chain_spec::ChainSpec;
-use futures::Future;
+use futures::{Future, FutureExt, TryFutureExt, future::select, channel::oneshot, compat::Future01CompatExt};
 use tokio::runtime::Runtime;
 use std::sync::Arc;
 use log::{info, error};
@@ -36,8 +36,9 @@ pub use service::{
 pub use cli::{VersionInfo, IntoExit, NoCustom};
 pub use cli::{display_role, error};
 
+type BoxedFuture = Box<dyn futures01::Future<Item = (), Error = ()> + Send>;
 /// Abstraction over an executor that lets you spawn tasks in the background.
-pub type TaskExecutor = Arc<dyn futures::future::Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Send + Sync>;
+pub type TaskExecutor = Arc<dyn futures01::future::Executor<BoxedFuture> + Send + Sync>;
 
 fn load_spec(id: &str) -> Result<Option<service::ChainSpec>, String> {
 	Ok(match ChainSpec::from(id) {
@@ -53,7 +54,7 @@ fn load_spec(id: &str) -> Result<Option<service::ChainSpec>, String> {
 pub trait Worker: IntoExit {
 	/// A future that resolves when the work is done or the node should exit.
 	/// This will be run on a tokio runtime.
-	type Work: Future<Item=(),Error=()> + Send + 'static;
+	type Work: Future<Output=()> + Unpin + Send + 'static;
 
 	/// Return configuration for the polkadot node.
 	// TODO: make this the full configuration, so embedded nodes don't need
@@ -86,20 +87,40 @@ struct ValidationWorkerCommand {
 	pub mem_id: String,
 }
 
+#[derive(Debug, StructOpt, Clone)]
+struct PolkadotSubParams {
+	#[structopt(long = "enable-authority-discovery")]
+	pub authority_discovery_enabled: bool,
+}
+
+cli::impl_augment_clap!(PolkadotSubParams);
+
 /// Parses polkadot specific CLI arguments and run the service.
 pub fn run<W>(worker: W, version: cli::VersionInfo) -> error::Result<()> where
 	W: Worker,
 {
-	match cli::parse_and_prepare::<PolkadotSubCommands, NoCustom, _>(&version, "parity-polkadot", std::env::args()) {
+	match cli::parse_and_prepare::<PolkadotSubCommands, PolkadotSubParams, _>(
+		&version,
+		"parity-polkadot",
+		std::env::args(),
+	) {
 		cli::ParseAndPrepare::Run(cmd) => cmd.run(load_spec, worker,
-		|worker, _cli_args, _custom_args, mut config| {
+		|worker, _cli_args, custom_args, mut config| {
 			info!("{}", version.name);
 			info!("  version {}", config.full_version());
 			info!("  by {}, 2017-2019", version.author);
 			info!("Chain specification: {}", config.chain_spec.name());
+			if config.chain_spec.name().starts_with("Kusama") {
+				info!("----------------------------");
+				info!("This chain is not in any way");
+				info!("      endorsed by the       ");
+				info!("     KUSAMA FOUNDATION      ");
+				info!("----------------------------");
+			}
 			info!("Node name: {}", config.name);
 			info!("Roles: {}", display_role(&config));
 			config.custom = worker.configuration();
+			config.custom.authority_discovery_enabled = custom_args.authority_discovery_enabled;
 			let runtime = Runtime::new().map_err(|e| format!("{:?}", e))?;
 			match config.roles {
 				service::Roles::LIGHT =>
@@ -119,6 +140,8 @@ pub fn run<W>(worker: W, version: cli::VersionInfo) -> error::Result<()> where
 		cli::ParseAndPrepare::ExportBlocks(cmd) => cmd.run_with_builder::<(), _, _, _, _, _, _>(|config|
 			Ok(service::new_chain_ops(config)?), load_spec, worker),
 		cli::ParseAndPrepare::ImportBlocks(cmd) => cmd.run_with_builder::<(), _, _, _, _, _, _>(|config|
+			Ok(service::new_chain_ops(config)?), load_spec, worker),
+		cli::ParseAndPrepare::CheckBlock(cmd) => cmd.run_with_builder::<(), _, _, _, _, _, _>(|config|
 			Ok(service::new_chain_ops(config)?), load_spec, worker),
 		cli::ParseAndPrepare::PurgeChain(cmd) => cmd.run(load_spec),
 		cli::ParseAndPrepare::RevertChain(cmd) => cmd.run_with_builder::<(), _, _, _, _, _>(|config|
@@ -143,20 +166,34 @@ fn run_until_exit<T, SC, B, CE, W>(
 		CE: service::CallExecutor<service::Block, service::Blake2Hasher> + Clone + Send + Sync + 'static,
 		W: Worker,
 {
-	let (exit_send, exit) = exit_future::signal();
+	let (exit_send, exit) = oneshot::channel();
 
 	let executor = runtime.executor();
 	let informant = cli::informant::build(&service);
-	executor.spawn(exit.until(informant).map(|_| ()));
+	let future = select(exit, informant)
+		.map(|_| Ok(()))
+		.compat();
+
+	executor.spawn(future);
 
 	// we eagerly drop the service so that the internal exit future is fired,
 	// but we need to keep holding a reference to the global telemetry guard
 	let _telemetry = service.telemetry();
 
 	let work = worker.work(&service, Arc::new(executor));
-	let service = service.map_err(|err| error!("Error while running Service: {}", err));
-	let _ = runtime.block_on(service.select(work));
-	exit_send.fire();
+	let service = service
+		.map_err(|err| error!("Error while running Service: {}", err))
+		.compat();
+	let future = select(service, work)
+		.map(|_| Ok::<_, ()>(()))
+		.compat();
+	let _ = runtime.block_on(future);
+	let _ = exit_send.send(());
+
+	use futures01::Future;
+
+	// TODO [andre]: timeout this future substrate/#1318
+	let _ = runtime.shutdown_on_idle().wait();
 
 	Ok(())
 }
