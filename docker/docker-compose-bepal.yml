@@ -1,0 +1,11 @@
+version: '3'
+services:
+  polkadot:
+    container_name: ksm
+    image: superbigfu/polkadot:latest
+    ports:
+      - "30333:30333/tcp"
+      - "9933:9933/tcp"
+    volumes:
+      - /my/local/foldet:/data
+    command: polkadot --chain kusama --rpc-external --rpc-cors=all --name "YourName"
