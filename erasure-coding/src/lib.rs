@@ -24,12 +24,12 @@
 //! f is the maximum number of faulty validators in the system.
 //! The data is coded so any f+1 chunks can be used to reconstruct the full data.
 
-use parity_codec::{Encode, Decode};
+use codec::{Encode, Decode};
 use reed_solomon::galois_16::{self, ReedSolomon};
 use primitives::{Hash as H256, BlakeTwo256, HashT};
-use primitives::parachain::{BlockData, Extrinsic};
-use substrate_primitives::Blake2Hasher;
-use trie::{MemoryDB, Trie, TrieMut, TrieDB, TrieDBMut};
+use primitives::parachain::{BlockData, AvailableMessages};
+use sp_core::Blake2Hasher;
+use trie::{EMPTY_PREFIX, MemoryDB, Trie, TrieMut, trie_types::{TrieDBMut, TrieDB}};
 
 use self::wrapped_shard::WrappedShard;
 
@@ -39,7 +39,7 @@ mod wrapped_shard;
 const MAX_VALIDATORS: usize = <galois_16::Field as reed_solomon::Field>::ORDER;
 
 /// Errors in erasure coding.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, derive_more::Display)]
 pub enum Error {
 	/// Returned when there are too many validators.
 	TooManyValidators,
@@ -56,6 +56,7 @@ pub enum Error {
 	/// An uneven byte-length of a shard is not valid for GF(2^16) encoding.
 	UnevenLength,
 	/// Chunk index out of bounds.
+	#[display(fmt = "Chunk is out of bounds: {} {}", _0, _1)]
 	ChunkIndexOutOfBounds(usize, usize),
 	/// Bad payload in reconstructed bytes.
 	BadPayload,
@@ -124,11 +125,11 @@ fn code_params(n_validators: usize) -> Result<CodeParams, Error> {
 /// Obtain erasure-coded chunks, one for each validator.
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
-pub fn obtain_chunks(n_validators: usize, block_data: &BlockData, extrinsic: &Extrinsic)
+pub fn obtain_chunks(n_validators: usize, block_data: &BlockData, outgoing: Option<&AvailableMessages>)
 	-> Result<Vec<Vec<u8>>, Error>
 {
-	let params  = code_params(n_validators)?;
-	let encoded = (block_data, extrinsic).encode();
+	let params = code_params(n_validators)?;
+	let encoded = (block_data, outgoing).encode();
 
 	if encoded.is_empty() {
 		return Err(Error::BadPayload);
@@ -150,7 +151,7 @@ pub fn obtain_chunks(n_validators: usize, block_data: &BlockData, extrinsic: &Ex
 ///
 /// Works only up to 65536 validators, and `n_validators` must be non-zero.
 pub fn reconstruct<'a, I: 'a>(n_validators: usize, chunks: I)
-	-> Result<(BlockData, Extrinsic), Error>
+	-> Result<(BlockData, Option<AvailableMessages>), Error>
 	where I: IntoIterator<Item=(&'a [u8], usize)>
 {
 	let params = code_params(n_validators)?;
@@ -187,30 +188,31 @@ pub fn reconstruct<'a, I: 'a>(n_validators: usize, chunks: I)
 
 	// lazily decode from the data shards.
 	Decode::decode(&mut ShardInput {
+		remaining_len: shard_len.map(|s| s * params.data_shards).unwrap_or(0),
 		cur_shard: None,
 		shards: shards.iter()
 			.map(|x| x.as_ref())
 			.take(params.data_shards)
 			.map(|x| x.expect("all data shards have been recovered; qed"))
 			.map(|x| x.as_ref()),
-	}).ok_or_else(|| Error::BadPayload)
+	}).or_else(|_| Err(Error::BadPayload))
 }
 
 /// An iterator that yields merkle branches and chunk data for all chunks to
 /// be sent to other validators.
-pub struct Branches<'a> {
+pub struct Branches<'a, I> {
 	trie_storage: MemoryDB<Blake2Hasher>,
 	root: H256,
-	chunks: Vec<&'a [u8]>,
+	chunks: &'a [I],
 	current_pos: usize,
 }
 
-impl<'a> Branches<'a> {
+impl<'a, I: AsRef<[u8]>> Branches<'a, I> {
 	/// Get the trie root.
 	pub fn root(&self) -> H256 { self.root.clone() }
 }
 
-impl<'a> Iterator for Branches<'a> {
+impl<'a, I: AsRef<[u8]>> Iterator for Branches<'a, I> {
 	type Item = (Vec<Vec<u8>>, &'a [u8]);
 
 	fn next(&mut self) -> Option<Self::Item> {
@@ -227,11 +229,11 @@ impl<'a> Iterator for Branches<'a> {
 		match res.expect("all nodes in trie present; qed") {
 			Some(_) => {
 				let nodes = recorder.drain().into_iter().map(|r| r.data).collect();
-				let chunk = &self.chunks.get(self.current_pos)
+				let chunk = self.chunks.get(self.current_pos)
 					.expect("there is a one-to-one mapping of chunks to valid merkle branches; qed");
 
 				self.current_pos += 1;
-				Some((nodes, chunk))
+				Some((nodes, chunk.as_ref()))
 			}
 			None => None,
 		}
@@ -240,16 +242,18 @@ impl<'a> Iterator for Branches<'a> {
 
 /// Construct a trie from chunks of an erasure-coded value. This returns the root hash and an
 /// iterator of merkle proofs, one for each validator.
-pub fn branches<'a>(chunks: Vec<&'a [u8]>) -> Branches<'a> {
+pub fn branches<'a, I: 'a>(chunks: &'a [I]) -> Branches<'a, I>
+	where I: AsRef<[u8]>,
+{
 	let mut trie_storage: MemoryDB<Blake2Hasher> = MemoryDB::default();
 	let mut root = H256::default();
 
 	// construct trie mapping each chunk's index to its hash.
 	{
 		let mut trie = TrieDBMut::new(&mut trie_storage, &mut root);
-		for (i, &chunk) in chunks.iter().enumerate() {
+		for (i, chunk) in chunks.as_ref().iter().enumerate() {
 			(i as u32).using_encoded(|encoded_index| {
-				let chunk_hash = BlakeTwo256::hash(chunk);
+				let chunk_hash = BlakeTwo256::hash(chunk.as_ref());
 				trie.insert(encoded_index, chunk_hash.as_ref())
 					.expect("a fresh trie stored in memory cannot have errors loading nodes; qed");
 			})
@@ -259,7 +263,7 @@ pub fn branches<'a>(chunks: Vec<&'a [u8]>) -> Branches<'a> {
 	Branches {
 		trie_storage,
 		root,
-		chunks,
+		chunks: chunks,
 		current_pos: 0,
 	}
 }
@@ -269,7 +273,7 @@ pub fn branches<'a>(chunks: Vec<&'a [u8]>) -> Branches<'a> {
 pub fn branch_hash(root: &H256, branch_nodes: &[Vec<u8>], index: usize) -> Result<H256, Error> {
 	let mut trie_storage: MemoryDB<Blake2Hasher> = MemoryDB::default();
 	for node in branch_nodes.iter() {
-		(&mut trie_storage as &mut trie::HashDB<_>).insert(&[], node.as_slice());
+		(&mut trie_storage as &mut trie::HashDB<_>).insert(EMPTY_PREFIX, node.as_slice());
 	}
 
 	let trie = TrieDB::new(&trie_storage, &root).map_err(|_| Error::InvalidBranchProof)?;
@@ -278,21 +282,26 @@ pub fn branch_hash(root: &H256, branch_nodes: &[Vec<u8>], index: usize) -> Resul
 	);
 
 	match res {
-		Ok(Some(Some(hash))) => Ok(hash),
-		Ok(Some(None)) => Err(Error::InvalidBranchProof), // hash failed to decode
+		Ok(Some(Ok(hash))) => Ok(hash),
+		Ok(Some(Err(_))) => Err(Error::InvalidBranchProof), // hash failed to decode
 		Ok(None) => Err(Error::BranchOutOfBounds),
 		Err(_) => Err(Error::InvalidBranchProof),
 	}
 }
 
-// input for `parity_codec` which draws data from the data shards
+// input for `codec` which draws data from the data shards
 struct ShardInput<'a, I> {
+	remaining_len: usize,
 	shards: I,
 	cur_shard: Option<(&'a [u8], usize)>,
 }
 
-impl<'a, I: Iterator<Item=&'a [u8]>> parity_codec::Input for ShardInput<'a, I> {
-	fn read(&mut self, into: &mut [u8]) -> usize {
+impl<'a, I: Iterator<Item=&'a [u8]>> codec::Input for ShardInput<'a, I> {
+	fn remaining_len(&mut self) -> Result<Option<usize>, codec::Error> {
+		Ok(Some(self.remaining_len))
+	}
+
+	fn read(&mut self, into: &mut [u8]) -> Result<(), codec::Error> {
 		let mut read_bytes = 0;
 
 		loop {
@@ -320,7 +329,12 @@ impl<'a, I: Iterator<Item=&'a [u8]>> parity_codec::Input for ShardInput<'a, I> {
 			self.cur_shard = Some((active_shard, in_shard))
 		}
 
-		read_bytes
+		self.remaining_len -= read_bytes;
+		if read_bytes == into.len() {
+			Ok(())
+		} else {
+			Err("slice provided too big for input".into())
+		}
 	}
 }
 
@@ -388,11 +402,11 @@ mod tests {
     #[test]
 	fn round_trip_block_data() {
 		let block_data = BlockData((0..255).collect());
-		let ex = Extrinsic { outgoing_messages: Vec::new() };
+		let ex = Some(AvailableMessages(Vec::new()));
 		let chunks = obtain_chunks(
 			10,
 			&block_data,
-			&ex,
+			ex.as_ref(),
 		).unwrap();
 
 		assert_eq!(chunks.len(), 10);
@@ -414,16 +428,17 @@ mod tests {
 	#[test]
 	fn construct_valid_branches() {
 		let block_data = BlockData(vec![2; 256]);
+		let ex = Some(AvailableMessages(Vec::new()));
+
 		let chunks = obtain_chunks(
 			10,
 			&block_data,
-			&Extrinsic { outgoing_messages: Vec::new() },
+			ex.as_ref(),
 		).unwrap();
-		let chunks: Vec<_> = chunks.iter().map(|c| &c[..]).collect();
 
 		assert_eq!(chunks.len(), 10);
 
-		let branches = branches(chunks.clone());
+		let branches = branches(chunks.as_ref());
 		let root = branches.root();
 
 		let proofs: Vec<_> = branches.map(|(proof, _)| proof).collect();
@@ -431,7 +446,7 @@ mod tests {
 		assert_eq!(proofs.len(), 10);
 
 		for (i, proof) in proofs.into_iter().enumerate() {
-			assert_eq!(branch_hash(&root, &proof, i).unwrap(), BlakeTwo256::hash(chunks[i]));
+			assert_eq!(branch_hash(&root, &proof, i).unwrap(), BlakeTwo256::hash(&chunks[i]));
 		}
 	}
 }

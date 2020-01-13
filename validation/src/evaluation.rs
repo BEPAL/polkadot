@@ -18,9 +18,9 @@
 
 use super::MAX_TRANSACTIONS_SIZE;
 
-use parity_codec::Encode;
+use codec::Encode;
 use polkadot_primitives::{Block, Hash, BlockNumber};
-use polkadot_primitives::parachain::Id as ParaId;
+use polkadot_primitives::parachain::{Id as ParaId, CollatorId, Retriable};
 
 /// Result type alias for block evaluation
 pub type Result<T> = std::result::Result<T, Error>;
@@ -29,7 +29,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, derive_more::Display, derive_more::From)]
 pub enum Error {
 	/// Client error
-	Client(client::error::Error),
+	Client(sp_blockchain::Error),
 	/// Too many parachain candidates in proposal
 	#[display(fmt = "Proposal included {} candidates for {} parachains", expected, got)]
 	TooManyCandidates { expected: usize, got: usize },
@@ -66,7 +66,7 @@ pub fn evaluate_initial(
 	_now: u64,
 	parent_hash: &Hash,
 	parent_number: BlockNumber,
-	_active_parachains: &[ParaId],
+	_active_parachains: &[(ParaId, Option<(CollatorId, Retriable)>)],
 ) -> Result<()> {
 	let transactions_size = proposal.extrinsics.iter().fold(0, |a, tx| {
 		a + Encode::encode(tx).len()

@@ -1,25 +1,28 @@
 [package]
 name = "polkadot-network"
-version = "0.1.0"
+version = "0.7.10"
 authors = ["Parity Technologies <admin@parity.io>"]
 description = "Polkadot-specific networking protocol"
 edition = "2018"
 
 [dependencies]
-arrayvec = "0.4"
-parking_lot = "0.7.1"
+arrayvec = "0.4.12"
+parking_lot = "0.9.0"
 av_store = { package = "polkadot-availability-store", path = "../availability-store" }
 polkadot-validation = { path = "../validation" }
 polkadot-primitives = { path = "../primitives" }
-parity-codec = { version = "4.1", features = ["derive"] }
-substrate-network = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
-substrate-primitives = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
-sr-primitives = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
-futures = "0.1"
-tokio = "0.1.7"
-log = "0.4"
-exit-future = "0.1.4"
+polkadot-erasure-coding = { path = "../erasure-coding" }
+codec = { package = "parity-scale-codec", version = "1.1.0", default-features = false, features = ["derive"] }
+sc-network = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sc-network-gossip = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sp-core = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sp-runtime = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+futures = "0.3.1"
+log = "0.4.8"
+exit-future = "0.2.0"
+sc-client = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sp-blockchain = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
 
 [dev-dependencies]
-substrate-client = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
-substrate-keyring = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sp-keyring = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }
+sp-api = { git = "https://github.com/paritytech/substrate", branch = "polkadot-master" }

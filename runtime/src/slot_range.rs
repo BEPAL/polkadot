@@ -18,8 +18,8 @@
 //! represent all sub ranges between 0 and 3 inclusive.
 
 use rstd::{result, ops::Add, convert::{TryFrom, TryInto}};
-use sr_primitives::traits::CheckedSub;
-use parity_codec::{Encode, Decode};
+use sp_runtime::traits::CheckedSub;
+use codec::{Encode, Decode};
 
 /// Total number of possible sub ranges of slots.
 pub const SLOT_RANGE_COUNT: usize = 10;

@@ -19,17 +19,23 @@
 //! information for commissioning and decommissioning them.
 
 use rstd::{prelude::*, mem::swap, convert::TryInto};
-use sr_primitives::traits::{CheckedSub, StaticLookup, Zero, One, CheckedConversion, Hash};
-use parity_codec::{Encode, Decode};
-use srml_support::{decl_module, decl_storage, decl_event, StorageValue, StorageMap, ensure,
-	traits::{Currency, ReservableCurrency, WithdrawReason, ExistenceRequirement, Get}};
-use primitives::parachain::AccountIdConversion;
-use crate::parachains::ParachainRegistrar;
-use system::ensure_signed;
+use sp_runtime::traits::{
+	CheckedSub, StaticLookup, Zero, One, CheckedConversion, Hash, AccountIdConversion,
+};
+use frame_support::weights::SimpleDispatchInfo;
+use codec::{Encode, Decode, Codec};
+use frame_support::{
+	decl_module, decl_storage, decl_event, ensure,
+	traits::{Currency, ReservableCurrency, WithdrawReason, ExistenceRequirement, Get, Randomness},
+};
+use primitives::parachain::{
+	SwapAux, PARACHAIN_INFO, Id as ParaId
+};
+use system::{ensure_signed, ensure_root};
+use crate::registrar::{Registrar, swap_ordered_existence};
 use crate::slot_range::{SlotRange, SLOT_RANGE_COUNT};
 
 type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as system::Trait>::AccountId>>::Balance;
-type ParaIdOf<T> = <<T as Trait>::Parachains as ParachainRegistrar<<T as system::Trait>::AccountId>>::ParaId;
 
 /// The module's configuration trait.
 pub trait Trait: system::Trait {
@@ -40,13 +46,16 @@ pub trait Trait: system::Trait {
 	type Currency: ReservableCurrency<Self::AccountId>;
 
 	/// The parachain registrar type.
-	type Parachains: ParachainRegistrar<Self::AccountId>;
+	type Parachains: Registrar<Self::AccountId>;
 
 	/// The number of blocks over which an auction may be retroactively ended.
 	type EndingPeriod: Get<Self::BlockNumber>;
 
 	/// The number of blocks over which a single period lasts.
 	type LeasePeriod: Get<Self::BlockNumber>;
+
+	/// Something that provides randomness in the runtime.
+	type Randomness: Randomness<Self::Hash>;
 }
 
 /// A sub-bidder identifier. Used to distinguish between different logical bidders coming from the
@@ -62,16 +71,16 @@ pub type AuctionIndex = u32;
 #[cfg_attr(feature = "std", derive(Debug))]
 pub struct NewBidder<AccountId> {
 	/// The bidder's account ID; this is the account that funds the bid.
-	who: AccountId,
+	pub who: AccountId,
 	/// An additional ID to allow the same account ID (and funding source) to have multiple
 	/// logical bidders.
-	sub: SubId,
+	pub sub: SubId,
 }
 
 /// The desired target of a bidder in an auction.
 #[derive(Clone, Eq, PartialEq, Encode, Decode)]
 #[cfg_attr(feature = "std", derive(Debug))]
-pub enum Bidder<AccountId, ParaId> {
+pub enum Bidder<AccountId> {
 	/// An account ID, funds coming from that account.
 	New(NewBidder<AccountId>),
 
@@ -80,7 +89,7 @@ pub enum Bidder<AccountId, ParaId> {
 	Existing(ParaId),
 }
 
-impl<AccountId: Clone, ParaId: AccountIdConversion<AccountId>> Bidder<AccountId, ParaId> {
+impl<AccountId: Clone + Default + Codec> Bidder<AccountId> {
 	/// Get the account that will fund this bid.
 	fn funding_account(&self) -> AccountId {
 		match self {
@@ -107,21 +116,22 @@ pub enum IncomingParachain<AccountId, Hash> {
 
 type LeasePeriodOf<T> = <T as system::Trait>::BlockNumber;
 // Winning data type. This encodes the top bidders of each range together with their bid.
-type WinningData<T> = [Option<(Bidder<<T as system::Trait>::AccountId, ParaIdOf<T>>, BalanceOf<T>)>; SLOT_RANGE_COUNT];
+type WinningData<T> =
+	[Option<(Bidder<<T as system::Trait>::AccountId>, BalanceOf<T>)>; SLOT_RANGE_COUNT];
 // Winners data type. This encodes each of the final winners of a parachain auction, the parachain
 // index assigned to them, their winning bid and the range that they won.
-type WinnersData<T> = Vec<(Option<NewBidder<<T as system::Trait>::AccountId>>, ParaIdOf<T>, BalanceOf<T>, SlotRange)>;
+type WinnersData<T> =
+	Vec<(Option<NewBidder<<T as system::Trait>::AccountId>>, ParaId, BalanceOf<T>, SlotRange)>;
 
 // This module's storage items.
 decl_storage! {
 	trait Store for Module<T: Trait> as Slots {
-
-		/// The number of auctions that been started so far.
+		/// The number of auctions that have been started so far.
 		pub AuctionCounter get(auction_counter): AuctionIndex;
 
-		/// All `ParaId` values that are managed by this module. This includes chains that are not
-		/// yet deployed (but have won an auction in the future).
-		pub ManagedIds get(managed_ids): Vec<ParaIdOf<T>>;
+		/// Ordered list of all `ParaId` values that are managed by this module. This includes
+		/// chains that are not yet deployed (but have won an auction in the future).
+		pub ManagedIds get(managed_ids): Vec<ParaId>;
 
 		/// Various amounts on deposit for each parachain. An entry in `ManagedIds` implies a non-
 		/// default entry here.
@@ -136,7 +146,7 @@ decl_storage! {
 		/// If a parachain doesn't exist *yet* but is scheduled to exist in the future, then it
 		/// will be left-padded with one or more zeroes to denote the fact that nothing is held on
 		/// deposit for the non-existent chain currently, but is held at some point in the future.
-		pub Deposits get(deposits): map ParaIdOf<T> => Vec<BalanceOf<T>>;
+		pub Deposits get(deposits): map ParaId => Vec<BalanceOf<T>>;
 
 		/// Information relating to the current auction, if there is one.
 		///
@@ -152,22 +162,37 @@ decl_storage! {
 
 		/// Amounts currently reserved in the accounts of the bidders currently winning
 		/// (sub-)ranges.
-		pub ReservedAmounts get(reserved_amounts): map Bidder<T::AccountId, ParaIdOf<T>> => Option<BalanceOf<T>>;
+		pub ReservedAmounts get(reserved_amounts): map Bidder<T::AccountId> => Option<BalanceOf<T>>;
 
 		/// The set of Para IDs that have won and need to be on-boarded at an upcoming lease-period.
 		/// This is cleared out on the first block of the lease period.
-		pub OnboardQueue get(onboard_queue): map LeasePeriodOf<T> => Vec<ParaIdOf<T>>;
+		pub OnboardQueue get(onboard_queue): map LeasePeriodOf<T> => Vec<ParaId>;
 
 		/// The actual on-boarding information. Only exists when one of the following is true:
 		/// - It is before the lease period that the parachain should be on-boarded.
 		/// - The full on-boarding information has not yet been provided and the parachain is not
 		/// yet due to be off-boarded.
-		pub Onboarding get(onboarding): map ParaIdOf<T> =>
+		pub Onboarding get(onboarding): map ParaId =>
 			Option<(LeasePeriodOf<T>, IncomingParachain<T::AccountId, T::Hash>)>;
 
 		/// Off-boarding account; currency held on deposit for the parachain gets placed here if the
 		/// parachain gets off-boarded; i.e. its lease period is up and it isn't renewed.
-		pub Offboarding get(offboarding): map ParaIdOf<T> => T::AccountId;
+		pub Offboarding get(offboarding): map ParaId => T::AccountId;
+	}
+}
+
+impl<T: Trait> SwapAux for Module<T> {
+	fn ensure_can_swap(one: ParaId, other: ParaId) -> Result<(), &'static str> {
+		if <Onboarding<T>>::exists(one) || <Onboarding<T>>::exists(other) {
+			Err("can't swap an undeployed parachain")?
+		}
+		Ok(())
+	}
+	fn on_swap(one: ParaId, other: ParaId) -> Result<(), &'static str> {
+		<Offboarding<T>>::swap(one, other);
+		<Deposits<T>>::swap(one, other);
+		ManagedIds::mutate(|ids| swap_ordered_existence(ids, one, other));
+		Ok(())
 	}
 }
 
@@ -176,7 +201,7 @@ decl_event!(
 		AccountId = <T as system::Trait>::AccountId,
 		BlockNumber = <T as system::Trait>::BlockNumber,
 		LeasePeriod = LeasePeriodOf<T>,
-		ParaId = ParaIdOf<T>,
+		ParaId = ParaId,
 		Balance = BalanceOf<T>,
 	{
 		/// A new lease period is beginning.
@@ -189,6 +214,7 @@ decl_event!(
 		/// Someone won the right to deploy a parachain. Balance amount is deducted for deposit.
 		WonDeploy(NewBidder<AccountId>, SlotRange, ParaId, Balance),
 		/// An existing parachain won the right to continue.
+		/// First balance is the extra amount reseved. Second is the total amount reserved.
 		WonRenewal(ParaId, SlotRange, Balance, Balance),
 		/// Funds were reserved for a winning bid. First balance is the extra amount reserved.
 		/// Second is the total.
@@ -200,7 +226,7 @@ decl_event!(
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		fn deposit_event<T>() = default;
+		fn deposit_event() = default;
 
 		fn on_initialize(n: T::BlockNumber) {
 			let lease_period = T::LeasePeriod::get();
@@ -242,10 +268,12 @@ decl_module! {
 		/// This can only happen when there isn't already an auction in progress and may only be
 		/// called by the root origin. Accepts the `duration` of this auction and the
 		/// `lease_period_index` of the initial lease period of the four that are to be auctioned.
-		fn new_auction(
+		#[weight = SimpleDispatchInfo::FixedOperational(100_000)]
+		pub fn new_auction(origin,
 			#[compact] duration: T::BlockNumber,
 			#[compact] lease_period_index: LeasePeriodOf<T>
 		) {
+			ensure_root(origin)?;
 			ensure!(!Self::is_in_progress(), "auction already in progress");
 			ensure!(lease_period_index >= Self::lease_period_index(), "lease period in past");
 
@@ -275,7 +303,8 @@ decl_module! {
 		/// absolute lease period index value, not an auction-specific offset.
 		/// - `amount` is the amount to bid to be held as deposit for the parachain should the
 		/// bid win. This amount is held throughout the range.
-		fn bid(origin,
+		#[weight = SimpleDispatchInfo::FixedNormal(500_000)]
+		pub fn bid(origin,
 			#[compact] sub: SubId,
 			#[compact] auction_index: AuctionIndex,
 			#[compact] first_slot: LeasePeriodOf<T>,
@@ -302,6 +331,7 @@ decl_module! {
 		/// absolute lease period index value, not an auction-specific offset.
 		/// - `amount` is the amount to bid to be held as deposit for the parachain should the
 		/// bid win. This amount is held throughout the range.
+		#[weight = SimpleDispatchInfo::FixedNormal(500_000)]
 		fn bid_renew(origin,
 			#[compact] auction_index: AuctionIndex,
 			#[compact] first_slot: LeasePeriodOf<T>,
@@ -309,7 +339,7 @@ decl_module! {
 			#[compact] amount: BalanceOf<T>
 		) {
 			let who = ensure_signed(origin)?;
-			let para_id = <ParaIdOf<T>>::try_from_account(&who)
+			let para_id = <ParaId>::try_from_account(&who)
 				.ok_or("account is not a parachain")?;
 			let bidder = Bidder::Existing(para_id);
 			Self::handle_bid(bidder, auction_index, first_slot, last_slot, amount)?;
@@ -320,10 +350,11 @@ decl_module! {
 		/// The origin *must* be a parachain account.
 		///
 		/// - `dest` is the destination account to receive the parachain's deposit.
-		fn set_offboarding(origin, dest: <T::Lookup as StaticLookup>::Source) {
+		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000)]
+		pub fn set_offboarding(origin, dest: <T::Lookup as StaticLookup>::Source) {
 			let who = ensure_signed(origin)?;
 			let dest = T::Lookup::lookup(dest)?;
-			let para_id = <ParaIdOf<T>>::try_from_account(&who)
+			let para_id = <ParaId>::try_from_account(&who)
 				.ok_or("not a parachain origin")?;
 			<Offboarding<T>>::insert(para_id, dest);
 		}
@@ -335,9 +366,10 @@ decl_module! {
 		/// - `para_id` is the parachain ID allotted to the winning bidder.
 		/// - `code_hash` is the hash of the parachain's Wasm validation function.
 		/// - `initial_head_data` is the parachain's initial head data.
-		fn fix_deploy_data(origin,
+		#[weight = SimpleDispatchInfo::FixedNormal(500_000)]
+		pub fn fix_deploy_data(origin,
 			#[compact] sub: SubId,
-			#[compact] para_id: ParaIdOf<T>,
+			#[compact] para_id: ParaId,
 			code_hash: T::Hash,
 			initial_head_data: Vec<u8>
 		) {
@@ -365,7 +397,8 @@ decl_module! {
 		/// - `_origin` is irrelevant.
 		/// - `para_id` is the parachain ID whose code will be elaborated.
 		/// - `code` is the preimage of the registered `code_hash` of `para_id`.
-		fn elaborate_deploy_data(_origin, #[compact] para_id: ParaIdOf<T>, code: Vec<u8>) {
+		#[weight = SimpleDispatchInfo::FixedNormal(5_000_000)]
+		pub fn elaborate_deploy_data(_origin, #[compact] para_id: ParaId, code: Vec<u8>) {
 			let (starts, details) = <Onboarding<T>>::get(&para_id)
 				.ok_or("parachain id not in onboarding")?;
 			if let IncomingParachain::Fixed{code_hash, initial_head_data} = details {
@@ -378,7 +411,8 @@ decl_module! {
 					// Should have already begun. Remove the on-boarding entry and register the
 					// parachain for its immediate start.
 					<Onboarding<T>>::remove(&para_id);
-					let _ = T::Parachains::register_parachain(para_id, code, initial_head_data);
+					let _ = T::Parachains::
+						register_para(para_id, PARACHAIN_INFO, code, initial_head_data);
 				}
 			} else {
 				return Err("deploy data not yet fixed")
@@ -389,18 +423,18 @@ decl_module! {
 
 impl<T: Trait> Module<T> {
 	/// Deposit currently held for a particular parachain that we administer.
-	fn deposit_held(para_id: &ParaIdOf<T>) -> BalanceOf<T> {
+	fn deposit_held(para_id: &ParaId) -> BalanceOf<T> {
 		<Deposits<T>>::get(para_id).into_iter().max().unwrap_or_else(Zero::zero)
 	}
 
 	/// True if an auction is in progress.
-	fn is_in_progress() -> bool {
+	pub fn is_in_progress() -> bool {
 		<AuctionInfo<T>>::exists()
 	}
 
 	/// Returns `Some(n)` if the now block is part of the ending period of an auction, where `n`
 	/// represents how far into the ending period this block is. Otherwise, returns `None`.
-	fn is_ending(now: T::BlockNumber) -> Option<T::BlockNumber> {
+	pub fn is_ending(now: T::BlockNumber) -> Option<T::BlockNumber> {
 		if let Some((_, early_end)) = <AuctionInfo<T>>::get() {
 			if let Some(after_early_end) = now.checked_sub(&early_end) {
 				if after_early_end < T::EndingPeriod::get() {
@@ -427,7 +461,7 @@ impl<T: Trait> Module<T> {
 			if early_end + T::EndingPeriod::get() == now {
 				// Just ended!
 				let ending_period = T::EndingPeriod::get();
-				let offset = T::BlockNumber::decode(&mut<system::Module<T>>::random_seed().as_ref())
+				let offset = T::BlockNumber::decode(&mut T::Randomness::random_seed().as_ref())
 					.expect("secure hashes always bigger than block numbers; qed") % ending_period;
 				let res = <Winning<T>>::get(offset).unwrap_or_default();
 				let mut i = T::BlockNumber::zero();
@@ -475,16 +509,22 @@ impl<T: Trait> Module<T> {
 					if T::Currency::withdraw(
 						&bidder.who,
 						amount,
-						WithdrawReason::Fee,
+						WithdrawReason::Fee.into(),
 						ExistenceRequirement::AllowDeath
 					).is_err() {
 						continue;
 					}
 
 					// Add para IDs of any chains that will be newly deployed to our set of managed
-					// IDs
-					<ManagedIds<T>>::mutate(|m| m.push(para_id));
-
+					// IDs.
+					ManagedIds::mutate(|ids|
+						if let Err(pos) = ids.binary_search(&para_id) {
+							ids.insert(pos, para_id)
+						} else {
+							// This can't happen as it's a winner being newly
+							// deployed and thus the para_id shouldn't already be being managed.
+						}
+					);
 					Self::deposit_event(RawEvent::WonDeploy(bidder.clone(), range, para_id, amount));
 
 					// Add a deployment record so we know to on-board them at the appropriate
@@ -492,6 +532,8 @@ impl<T: Trait> Module<T> {
 					let begin_offset = <LeasePeriodOf<T>>::from(range.as_pair().0 as u32);
 					let begin_lease_period = auction_lease_period_index + begin_offset;
 					<OnboardQueue<T>>::mutate(begin_lease_period, |starts| starts.push(para_id));
+					// Add a default off-boarding account which matches the original bidder
+					<Offboarding<T>>::insert(&para_id, &bidder.who);
 					let entry = (begin_lease_period, IncomingParachain::Unset(bidder));
 					<Onboarding<T>>::insert(&para_id, entry);
 				}
@@ -504,7 +546,7 @@ impl<T: Trait> Module<T> {
 						if T::Currency::withdraw(
 							&para_id.into_account(),
 							additional,
-							WithdrawReason::Fee,
+							WithdrawReason::Fee.into(),
 							ExistenceRequirement::AllowDeath
 						).is_err() {
 							continue;
@@ -513,7 +555,7 @@ impl<T: Trait> Module<T> {
 					} else {
 						Default::default()
 					};
-					Self::deposit_event(RawEvent::WonRenewal(para_id, range, amount, extra));
+					Self::deposit_event(RawEvent::WonRenewal(para_id, range, extra, amount));
 				}
 			}
 
@@ -561,7 +603,7 @@ impl<T: Trait> Module<T> {
 		Self::deposit_event(RawEvent::NewLeasePeriod(lease_period_index));
 		// First, bump off old deposits and decommission any managed chains that are coming
 		// to a close.
-		<ManagedIds<T>>::mutate(|ids| {
+		ManagedIds::mutate(|ids| {
 			let new = ids.drain(..).filter(|id| {
 				let mut d = <Deposits<T>>::get(id);
 				if !d.is_empty() {
@@ -574,7 +616,7 @@ impl<T: Trait> Module<T> {
 							// Only unregister it if it was actually registered in the first place.
 							// If the on-boarding entry still existed, then it was never actually
 							// commissioned.
-							let _ = T::Parachains::deregister_parachain(id.clone());
+							let _ = T::Parachains::deregister_para(id.clone());
 						}
 						// Return the full deposit to the off-boarding account.
 						T::Currency::deposit_creating(&<Offboarding<T>>::take(id), d[0]);
@@ -616,7 +658,8 @@ impl<T: Trait> Module<T> {
 			{
 				// The chain's deployment data is set; go ahead and register it, and remove the
 				// now-redundant on-boarding entry.
-				let _ = T::Parachains::register_parachain(para_id.clone(), code, initial_head_data);
+				let _ = T::Parachains::
+					register_para(para_id.clone(), PARACHAIN_INFO, code, initial_head_data);
 				// ^^ not much we can do if it fails for some reason.
 				<Onboarding<T>>::remove(para_id)
 			}
@@ -631,8 +674,8 @@ impl<T: Trait> Module<T> {
 	/// - `first_slot`: The first lease period index of the range to be bid on.
 	/// - `last_slot`: The last lease period index of the range to be bid on (inclusive).
 	/// - `amount`: The total amount to be the bid for deposit over the range.
-	fn handle_bid(
-		bidder: Bidder<T::AccountId, ParaIdOf<T>>,
+	pub fn handle_bid(
+		bidder: Bidder<T::AccountId>,
 		auction_index: u32,
 		first_slot: LeasePeriodOf<T>,
 		last_slot: LeasePeriodOf<T>,
@@ -723,7 +766,7 @@ impl<T: Trait> Module<T> {
 	/// https://github.com/w3f/consensus/blob/master/NPoS/auctiondynamicthing.py
 	fn calculate_winners(
 		mut winning: WinningData<T>,
-		new_id: impl Fn() -> ParaIdOf<T>
+		new_id: impl Fn() -> ParaId
 	) -> WinnersData<T> {
 		let winning_ranges = {
 			let mut best_winners_ending_at:
@@ -771,21 +814,20 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-
 /// tests for this module
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use std::{result::Result, collections::HashMap, cell::RefCell};
 
-	use substrate_primitives::{Blake2Hasher, H256};
-	use sr_io::with_externalities;
-	use sr_primitives::{
-		testing::Header, traits::{BlakeTwo256, Hash, IdentityLookup, OnInitialize, OnFinalize},
+	use sp_core::H256;
+	use sp_runtime::{
+		Perbill, testing::Header,
+		traits::{BlakeTwo256, Hash, IdentityLookup, OnInitialize, OnFinalize},
 	};
-	use srml_support::{impl_outer_origin, parameter_types, assert_ok, assert_noop};
+	use frame_support::{impl_outer_origin, parameter_types, assert_ok, assert_noop};
 	use balances;
-	use primitives::parachain::Id as ParaId;
+	use primitives::parachain::{Id as ParaId, Info as ParaInfo};
 
 	impl_outer_origin! {
 		pub enum Origin for Test {}
@@ -796,8 +838,15 @@ mod tests {
 	// configuration traits of modules we want to use.
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
+	parameter_types! {
+		pub const BlockHashCount: u32 = 250;
+		pub const MaximumBlockWeight: u32 = 4 * 1024 * 1024;
+		pub const MaximumBlockLength: u32 = 4 * 1024 * 1024;
+		pub const AvailableBlockRatio: Perbill = Perbill::from_percent(75);
+	}
 	impl system::Trait for Test {
 		type Origin = Origin;
+		type Call = ();
 		type Index = u64;
 		type BlockNumber = u64;
 		type Hash = H256;
@@ -806,14 +855,17 @@ mod tests {
 		type Lookup = IdentityLookup<Self::AccountId>;
 		type Header = Header;
 		type Event = ();
+		type BlockHashCount = BlockHashCount;
+		type MaximumBlockWeight = MaximumBlockWeight;
+		type MaximumBlockLength = MaximumBlockLength;
+		type AvailableBlockRatio = AvailableBlockRatio;
+		type Version = ();
 	}
 
 	parameter_types! {
 		pub const ExistentialDeposit: u64 = 0;
 		pub const TransferFee: u64 = 0;
 		pub const CreationFee: u64 = 0;
-		pub const TransactionBaseFee: u64 = 0;
-		pub const TransactionByteFee: u64 = 0;
 	}
 
 	impl balances::Trait for Test {
@@ -821,14 +873,11 @@ mod tests {
 		type OnFreeBalanceZero = ();
 		type OnNewAccount = ();
 		type Event = ();
-		type TransactionPayment = ();
 		type DustRemoval = ();
 		type TransferPayment = ();
 		type ExistentialDeposit = ExistentialDeposit;
 		type TransferFee = TransferFee;
 		type CreationFee = CreationFee;
-		type TransactionBaseFee = TransactionBaseFee;
-		type TransactionByteFee = TransactionByteFee;
 	}
 
 	thread_local! {
@@ -838,33 +887,33 @@ mod tests {
 	}
 
 	pub struct TestParachains;
-	impl ParachainRegistrar<u64> for TestParachains {
-		type ParaId = ParaId;
-		fn new_id() -> Self::ParaId {
+	impl Registrar<u64> for TestParachains {
+		fn new_id() -> ParaId {
 			PARACHAIN_COUNT.with(|p| {
 				*p.borrow_mut() += 1;
 				(*p.borrow() - 1).into()
 			})
 		}
-		fn register_parachain(
-			id: Self::ParaId,
+		fn register_para(
+			id: ParaId,
+			_info: ParaInfo,
 			code: Vec<u8>,
 			initial_head_data: Vec<u8>
 		) -> Result<(), &'static str> {
 			PARACHAINS.with(|p| {
-				if p.borrow().contains_key(&id.into_inner()) {
+				if p.borrow().contains_key(&id.into()) {
 					panic!("ID already exists")
 				}
-				p.borrow_mut().insert(id.into_inner(), (code, initial_head_data));
+				p.borrow_mut().insert(id.into(), (code, initial_head_data));
 				Ok(())
 			})
 		}
-		fn deregister_parachain(id: Self::ParaId) -> Result<(), &'static str> {
+		fn deregister_para(id: ParaId) -> Result<(), &'static str> {
 			PARACHAINS.with(|p| {
-				if !p.borrow().contains_key(&id.into_inner()) {
+				if !p.borrow().contains_key(&id.into()) {
 					panic!("ID doesn't exist")
 				}
-				p.borrow_mut().remove(&id.into_inner());
+				p.borrow_mut().remove(&id.into());
 				Ok(())
 			})
 		}
@@ -889,20 +938,22 @@ mod tests {
 		type Parachains = TestParachains;
 		type LeasePeriod = LeasePeriod;
 		type EndingPeriod = EndingPeriod;
+		type Randomness = RandomnessCollectiveFlip;
 	}
 
 	type System = system::Module<Test>;
 	type Balances = balances::Module<Test>;
 	type Slots = Module<Test>;
+	type RandomnessCollectiveFlip = randomness_collective_flip::Module<Test>;
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mock up.
-	fn new_test_ext() -> sr_io::TestExternalities<Blake2Hasher> {
-		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap().0;
-		t.extend(balances::GenesisConfig::<Test>{
+	fn new_test_ext() -> sp_io::TestExternalities {
+		let mut t = system::GenesisConfig::default().build_storage::<Test>().unwrap();
+		balances::GenesisConfig::<Test>{
 			balances: vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
 			vesting: vec![],
-		}.build_storage().unwrap().0);
+		}.assimilate_storage(&mut t).unwrap();
 		t.into()
 	}
 
@@ -920,7 +971,7 @@ mod tests {
 
 	#[test]
 	fn basic_setup_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			assert_eq!(Slots::auction_counter(), 0);
 			assert_eq!(Slots::deposit_held(&0u32.into()), 0);
 			assert_eq!(Slots::is_in_progress(), false);
@@ -937,10 +988,10 @@ mod tests {
 
 	#[test]
 	fn can_start_auction() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 
 			assert_eq!(Slots::auction_counter(), 1);
 			assert_eq!(Slots::is_in_progress(), true);
@@ -950,10 +1001,10 @@ mod tests {
 
 	#[test]
 	fn auction_proceeds_correctly() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 
 			assert_eq!(Slots::auction_counter(), 1);
 			assert_eq!(Slots::is_in_progress(), true);
@@ -995,17 +1046,17 @@ mod tests {
 
 	#[test]
 	fn can_win_auction() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 1));
 			assert_eq!(Balances::reserved_balance(&1), 1);
 			assert_eq!(Balances::free_balance(&1), 9);
 
 			run_to_block(9);
 			assert_eq!(Slots::onboard_queue(1), vec![0.into()]);
-			assert_eq!(Slots::onboarding(&0.into()),
+			assert_eq!(Slots::onboarding(ParaId::from(0)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 1, sub: 0 })))
 			);
 			assert_eq!(Slots::deposit_held(&0.into()), 1);
@@ -1016,14 +1067,32 @@ mod tests {
 
 	#[test]
 	fn offboarding_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
+			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 1));
+			assert_eq!(Balances::free_balance(&1), 9);
+
+			run_to_block(9);
+			assert_eq!(Slots::deposit_held(&0.into()), 1);
+			assert_eq!(Slots::deposits(ParaId::from(0))[0], 0);
+
+			run_to_block(50);
+			assert_eq!(Slots::deposit_held(&0.into()), 0);
+			assert_eq!(Balances::free_balance(&1), 10);
+		});
+	}
+
+	#[test]
+	fn set_offboarding_works() {
+		new_test_ext().execute_with(|| {
+			run_to_block(1);
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 1));
 
 			run_to_block(9);
 			assert_eq!(Slots::deposit_held(&0.into()), 1);
-			assert_eq!(Slots::deposits(&0.into())[0], 0);
+			assert_eq!(Slots::deposits(ParaId::from(0))[0], 0);
 
 			run_to_block(49);
 			assert_eq!(Slots::deposit_held(&0.into()), 1);
@@ -1037,9 +1106,9 @@ mod tests {
 
 	#[test]
 	fn onboarding_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 1));
 
 			run_to_block(9);
@@ -1057,9 +1126,9 @@ mod tests {
 
 	#[test]
 	fn late_onboarding_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 1));
 
 			run_to_block(10);
@@ -1080,9 +1149,9 @@ mod tests {
 
 	#[test]
 	fn under_bidding_works() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 4, 5));
 			assert_ok!(Slots::bid(Origin::signed(2), 0, 1, 1, 4, 1));
 			assert_eq!(Balances::reserved_balance(&2), 0);
@@ -1096,9 +1165,9 @@ mod tests {
 
 	#[test]
 	fn should_choose_best_combination() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 1, 1));
 			assert_ok!(Slots::bid(Origin::signed(2), 0, 1, 2, 3, 1));
 			assert_ok!(Slots::bid(Origin::signed(3), 0, 1, 4, 4, 2));
@@ -1106,17 +1175,17 @@ mod tests {
 			run_to_block(9);
 			assert_eq!(Slots::onboard_queue(1), vec![0.into()]);
 			assert_eq!(
-				Slots::onboarding(&0.into()),
+				Slots::onboarding(ParaId::from(0)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 1, sub: 0 })))
 			);
 			assert_eq!(Slots::onboard_queue(2), vec![1.into()]);
 			assert_eq!(
-				Slots::onboarding(&1.into()),
+				Slots::onboarding(ParaId::from(1)),
 				Some((2, IncomingParachain::Unset(NewBidder { who: 2, sub: 0 })))
 			);
 			assert_eq!(Slots::onboard_queue(4), vec![2.into()]);
 			assert_eq!(
-				Slots::onboarding(&2.into()),
+				Slots::onboarding(ParaId::from(2)),
 				Some((4, IncomingParachain::Unset(NewBidder { who: 3, sub: 0 })))
 			);
 		});
@@ -1124,9 +1193,9 @@ mod tests {
 
 	#[test]
 	fn independent_bids_should_fail() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(1, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 1, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 2, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 2, 4, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 2, 2, 1));
@@ -1139,41 +1208,41 @@ mod tests {
 
 	#[test]
 	fn multiple_onboards_offboards_should_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(1, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 1, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 1, 1));
 			assert_ok!(Slots::bid(Origin::signed(2), 0, 1, 2, 3, 1));
 			assert_ok!(Slots::bid(Origin::signed(3), 0, 1, 4, 4, 1));
 
 			run_to_block(5);
-			assert_ok!(Slots::new_auction(1, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 1, 1));
 			assert_ok!(Slots::bid(Origin::signed(4), 1, 2, 1, 2, 1));
 			assert_ok!(Slots::bid(Origin::signed(5), 1, 2, 3, 4, 1));
 
 			run_to_block(9);
 			assert_eq!(Slots::onboard_queue(1), vec![0.into(), 3.into()]);
 			assert_eq!(
-				Slots::onboarding(&0.into()),
+				Slots::onboarding(ParaId::from(0)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 1, sub: 0 })))
 			);
 			assert_eq!(
-				Slots::onboarding(&3.into()),
+				Slots::onboarding(ParaId::from(3)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 4, sub: 1 })))
 			);
 			assert_eq!(Slots::onboard_queue(2), vec![1.into()]);
 			assert_eq!(
-				Slots::onboarding(&1.into()),
+				Slots::onboarding(ParaId::from(1)),
 				Some((2, IncomingParachain::Unset(NewBidder { who: 2, sub: 0 })))
 			);
 			assert_eq!(Slots::onboard_queue(3), vec![4.into()]);
 			assert_eq!(
-				Slots::onboarding(&4.into()),
+				Slots::onboarding(ParaId::from(4)),
 				Some((3, IncomingParachain::Unset(NewBidder { who: 5, sub: 1 })))
 			);
 			assert_eq!(Slots::onboard_queue(4), vec![2.into()]);
 			assert_eq!(
-				Slots::onboarding(&2.into()),
+				Slots::onboarding(ParaId::from(2)),
 				Some((4, IncomingParachain::Unset(NewBidder { who: 3, sub: 0 })))
 			);
 
@@ -1216,9 +1285,9 @@ mod tests {
 
 	#[test]
 	fn extensions_should_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 1, 1));
 
 			run_to_block(9);
@@ -1229,7 +1298,7 @@ mod tests {
 			assert_ok!(Slots::fix_deploy_data(Origin::signed(1), 0, 0.into(), h, vec![1]));
 			assert_ok!(Slots::elaborate_deploy_data(Origin::signed(0), 0.into(), vec![1]));
 
-			assert_ok!(Slots::new_auction(5, 2));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 2));
 			assert_ok!(Slots::bid_renew(Origin::signed(ParaId::from(0).into_account()), 2, 2, 2, 1));
 
 			with_parachains(|p| {
@@ -1242,7 +1311,7 @@ mod tests {
 				assert_eq!(p.len(), 1);
 				assert_eq!(p[&0], (vec![1], vec![1]));
 			});
-			assert_ok!(Slots::new_auction(5, 2));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 2));
 			assert_ok!(Balances::transfer(Origin::signed(1), ParaId::from(0).into_account(), 1));
 			assert_ok!(Slots::bid_renew(Origin::signed(ParaId::from(0).into_account()), 3, 3, 3, 2));
 
@@ -1261,9 +1330,9 @@ mod tests {
 
 	#[test]
 	fn renewal_with_lower_value_should_work() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 1, 1, 5));
 
 			run_to_block(9);
@@ -1274,26 +1343,26 @@ mod tests {
 			assert_ok!(Slots::fix_deploy_data(Origin::signed(1), 0, 0.into(), h, vec![1]));
 			assert_ok!(Slots::elaborate_deploy_data(Origin::signed(0), 0.into(), vec![1]));
 
-			assert_ok!(Slots::new_auction(5, 2));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 2));
 			assert_ok!(Slots::bid_renew(Origin::signed(ParaId::from(0).into_account()), 2, 2, 2, 3));
 
 			run_to_block(20);
-			assert_eq!(Balances::free_balance(&ParaId::from(0).into_account()), 2);
+			assert_eq!(Balances::free_balance::<u64>(ParaId::from(0).into_account()), 2);
 
-			assert_ok!(Slots::new_auction(5, 2));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 2));
 			assert_ok!(Slots::bid_renew(Origin::signed(ParaId::from(0).into_account()), 3, 3, 3, 4));
 
 			run_to_block(30);
-			assert_eq!(Balances::free_balance(&ParaId::from(0).into_account()), 1);
+			assert_eq!(Balances::free_balance::<u64>(ParaId::from(0).into_account()), 1);
 		});
 	}
 
 	#[test]
 	fn can_win_incomplete_auction() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 			assert_ok!(Slots::bid(Origin::signed(1), 0, 1, 4, 4, 5));
 
 			run_to_block(9);
@@ -1301,8 +1370,8 @@ mod tests {
 			assert_eq!(Slots::onboard_queue(2), vec![]);
 			assert_eq!(Slots::onboard_queue(3), vec![]);
 			assert_eq!(Slots::onboard_queue(4), vec![0.into()]);
-			assert_eq!(Slots::onboarding(
-				&0.into()),
+			assert_eq!(
+				Slots::onboarding(ParaId::from(0)),
 				Some((4, IncomingParachain::Unset(NewBidder { who: 1, sub: 0 })))
 			);
 			assert_eq!(Slots::deposit_held(&0.into()), 5);
@@ -1311,10 +1380,10 @@ mod tests {
 
 	#[test]
 	fn multiple_bids_work_pre_ending() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 
 			for i in 1..6 {
 				run_to_block(i);
@@ -1328,7 +1397,7 @@ mod tests {
 			run_to_block(9);
 			assert_eq!(Slots::onboard_queue(1), vec![0.into()]);
 			assert_eq!(
-				Slots::onboarding(&0.into()),
+				Slots::onboarding(ParaId::from(0)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 5, sub: 0 })))
 			);
 			assert_eq!(Slots::deposit_held(&0.into()), 5);
@@ -1339,10 +1408,10 @@ mod tests {
 
 	#[test]
 	fn multiple_bids_work_post_ending() {
-		with_externalities(&mut new_test_ext(), || {
+		new_test_ext().execute_with(|| {
 			run_to_block(1);
 
-			assert_ok!(Slots::new_auction(5, 1));
+			assert_ok!(Slots::new_auction(Origin::ROOT, 5, 1));
 
 			for i in 1..6 {
 				run_to_block(i + 3);
@@ -1355,8 +1424,8 @@ mod tests {
 
 			run_to_block(9);
 			assert_eq!(Slots::onboard_queue(1), vec![0.into()]);
-			assert_eq!(Slots::onboarding(
-				&0.into()),
+			assert_eq!(
+				Slots::onboarding(ParaId::from(0)),
 				Some((1, IncomingParachain::Unset(NewBidder { who: 3, sub: 0 })))
 			);
 			assert_eq!(Slots::deposit_held(&0.into()), 3);

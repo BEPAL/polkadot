@@ -21,14 +21,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adder::{HeadData as AdderHead, BlockData as AdderBody};
-use substrate_primitives::Pair;
+use sp_core::{Pair, Blake2Hasher};
 use parachain::codec::{Encode, Decode};
 use primitives::{
-	Hash,
-	parachain::{HeadData, BlockData, Id as ParaId, Message, Extrinsic, Status as ParachainStatus},
+	Hash, Block,
+	parachain::{
+		HeadData, BlockData, Id as ParaId, Message, OutgoingMessages, Status as ParachainStatus,
+	},
 };
 use collator::{InvalidHead, ParachainContext, VersionInfo, Network, BuildParachainContext};
 use parking_lot::Mutex;
+use futures::{future::{Ready, ok, err}, task::Spawn};
 
 const GENESIS: AdderHead = AdderHead {
 	number: 0,
@@ -53,17 +56,19 @@ struct AdderContext {
 
 /// The parachain context.
 impl ParachainContext for AdderContext {
-	type ProduceCandidate = Result<(BlockData, HeadData, Extrinsic), InvalidHead>;
+	type ProduceCandidate = Ready<Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>>;
 
 	fn produce_candidate<I: IntoIterator<Item=(ParaId, Message)>>(
-		&self,
+		&mut self,
 		_relay_parent: Hash,
 		status: ParachainStatus,
 		ingress: I,
-	) -> Result<(BlockData, HeadData, Extrinsic), InvalidHead>
+	) -> Self::ProduceCandidate
 	{
-		let adder_head = AdderHead::decode(&mut &status.head_data.0[..])
-			.ok_or(InvalidHead)?;
+		let adder_head = match AdderHead::decode(&mut &status.head_data.0[..]) {
+			Ok(adder_head) => adder_head,
+			Err(_) => return err(InvalidHead)
+		};
 
 		let mut db = self.db.lock();
 
@@ -94,14 +99,24 @@ impl ParachainContext for AdderContext {
 			next_head.number, next_body.state.overflowing_add(next_body.add).0);
 
 		db.insert(next_head.clone(), next_body);
-		Ok((encoded_body, encoded_head, Extrinsic { outgoing_messages: Vec::new() }))
+		ok((encoded_body, encoded_head, OutgoingMessages { outgoing_messages: Vec::new() }))
 	}
 }
 
 impl BuildParachainContext for AdderContext {
 	type ParachainContext = Self;
 
-	fn build(self, network: Arc<dyn Network>) -> Result<Self::ParachainContext, ()> {
+	fn build<B, E, SP>(
+		self,
+		_: Arc<collator::PolkadotClient<B, E>>,
+		_: SP,
+		network: Arc<dyn Network>,
+	) -> Result<Self::ParachainContext, ()>
+		where
+			B: client_api::backend::Backend<Block, Blake2Hasher> + 'static,
+			E: client::CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static,
+			SP: Spawn + Clone + Send + Sync + 'static,
+	{
 		Ok(Self { _network: Some(network), ..self })
 	}
 }
@@ -129,7 +144,7 @@ fn main() {
 	let exit_send_cell = RefCell::new(Some(exit_send));
 	ctrlc::set_handler(move || {
 		if let Some(exit_send) = exit_send_cell.try_borrow_mut().expect("signal handler not reentrant; qed").take() {
-			exit_send.fire();
+			let _ = exit_send.fire();
 		}
 	}).expect("Error setting up ctrl-c handler");
 
@@ -143,7 +158,6 @@ fn main() {
 		id,
 		exit,
 		key,
-		::std::env::args(),
 		VersionInfo {
 			name: "<unknown>",
 			version: "<unknown>",

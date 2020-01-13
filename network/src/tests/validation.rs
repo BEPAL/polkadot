@@ -18,45 +18,44 @@
 
 #![allow(unused)]
 
-use crate::validation::{NetworkService, GossipService, GossipMessageStream};
 use crate::gossip::GossipMessage;
-use substrate_network::Context as NetContext;
-use substrate_network::consensus_gossip::TopicNotification;
-use substrate_primitives::{NativeOrEncoded, ExecutionContext};
-use substrate_keyring::AuthorityKeyring;
-use crate::PolkadotProtocol;
+use sc_network::{Context as NetContext, PeerId};
+use sc_network_gossip::TopicNotification;
+use sp_core::{NativeOrEncoded, ExecutionContext};
+use sp_keyring::Sr25519Keyring;
+use crate::{PolkadotProtocol, NetworkService, GossipMessageStream};
 
-use polkadot_validation::{SharedTable, MessagesFrom, Network};
-use polkadot_primitives::{SessionKey, Block, Hash, Header, BlockId};
+use polkadot_validation::{SharedTable, Network};
+use polkadot_primitives::{Block, BlockNumber, Hash, Header, BlockId};
 use polkadot_primitives::parachain::{
-	Id as ParaId, Chain, DutyRoster, ParachainHost, OutgoingMessage,
+	Id as ParaId, Chain, DutyRoster, ParachainHost, TargetedMessage,
 	ValidatorId, StructuredUnroutedIngress, BlockIngressRoots, Status,
-	FeeSchedule, HeadData,
+	FeeSchedule, HeadData, Retriable, CollatorId, ErasureChunk, CandidateReceipt,
 };
 use parking_lot::Mutex;
-use substrate_client::error::Result as ClientResult;
-use substrate_client::runtime_api::{Core, RuntimeVersion, ApiExt};
-use sr_primitives::traits::{ApiRef, ProvideRuntimeApi};
+use sp_blockchain::Result as ClientResult;
+use sp_api::{Core, RuntimeVersion, StorageProof, ApiExt};
+use sp_runtime::traits::{ApiRef, {Block as BlockT}, ProvideRuntimeApi};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use futures::{prelude::*, sync::mpsc};
-use tokio::runtime::Runtime;
-use parity_codec::Encode;
+use std::pin::Pin;
+use std::task::{Poll, Context};
+use futures::{prelude::*, channel::mpsc, future::{select, Either}};
+use codec::Encode;
 
-use super::TestContext;
+use super::{TestContext, TestChainContext};
 
-type TaskExecutor = Arc<dyn futures::future::Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Send + Sync>;
+type TaskExecutor = Arc<dyn futures::task::Spawn + Send + Sync>;
 
 #[derive(Clone, Copy)]
 struct NeverExit;
 
 impl Future for NeverExit {
-	type Item = ();
-	type Error = ();
+	type Output = ();
 
-	fn poll(&mut self) -> Poll<(), ()> {
-		Ok(Async::NotReady)
+	fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
+		Poll::Pending
 	}
 }
 
@@ -67,58 +66,35 @@ fn clone_gossip(n: &TopicNotification) -> TopicNotification {
 	}
 }
 
-struct GossipRouter {
-	incoming_messages: mpsc::UnboundedReceiver<(Hash, TopicNotification)>,
-	incoming_streams: mpsc::UnboundedReceiver<(Hash, mpsc::UnboundedSender<TopicNotification>)>,
-	outgoing: Vec<(Hash, mpsc::UnboundedSender<TopicNotification>)>,
-	messages: Vec<(Hash, TopicNotification)>,
-}
+async fn gossip_router(
+	mut incoming_messages: mpsc::UnboundedReceiver<(Hash, TopicNotification)>,
+	mut incoming_streams: mpsc::UnboundedReceiver<(Hash, mpsc::UnboundedSender<TopicNotification>)>
+) {
+	let mut outgoing: Vec<(Hash, mpsc::UnboundedSender<TopicNotification>)> = Vec::new();
+	let mut messages = Vec::new();
 
-impl GossipRouter {
-	fn add_message(&mut self, topic: Hash, message: TopicNotification) {
-		self.outgoing.retain(|&(ref o_topic, ref sender)| {
-			o_topic != &topic || sender.unbounded_send(clone_gossip(&message)).is_ok()
-		});
-		self.messages.push((topic, message));
-	}
+	loop {
+		match select(incoming_messages.next(), incoming_streams.next()).await {
+			Either::Left((Some((topic, message)), _)) => {
+				outgoing.retain(|&(ref o_topic, ref sender)| {
+					o_topic != &topic || sender.unbounded_send(clone_gossip(&message)).is_ok()
+				});
+				messages.push((topic, message));
+			},
+			Either::Right((Some((topic, sender)), _)) => {
+				for message in messages.iter()
+					.filter(|&&(ref t, _)| t == &topic)
+					.map(|&(_, ref msg)| clone_gossip(msg))
+				{
+					if let Err(_) = sender.unbounded_send(message) { return }
+				}
 
-	fn add_outgoing(&mut self, topic: Hash, sender: mpsc::UnboundedSender<TopicNotification>) {
-		for message in self.messages.iter()
-			.filter(|&&(ref t, _)| t == &topic)
-			.map(|&(_, ref msg)| clone_gossip(msg))
-		{
-			if let Err(_) = sender.unbounded_send(message) { return }
+				outgoing.push((topic, sender));
+			},
+			Either::Left((None, _)) | Either::Right((None, _)) =>  panic!("ended early.")
 		}
-
-		self.outgoing.push((topic, sender));
-	}
-}
-
-impl Future for GossipRouter {
-	type Item = ();
-	type Error = ();
-
-	fn poll(&mut self) -> Poll<(), ()> {
-		loop {
-			match self.incoming_messages.poll().unwrap() {
-				Async::Ready(Some((topic, message))) => self.add_message(topic, message),
-				Async::Ready(None) => panic!("ended early."),
-				Async::NotReady => break,
-			}
-		}
-
-		loop {
-			match self.incoming_streams.poll().unwrap() {
-				Async::Ready(Some((topic, sender))) => self.add_outgoing(topic, sender),
-				Async::Ready(None) => panic!("ended early."),
-				Async::NotReady => break,
-			}
-		}
-
-		Ok(Async::NotReady)
 	}
 }
-
 
 #[derive(Clone)]
 struct GossipHandle {
@@ -126,17 +102,12 @@ struct GossipHandle {
 	send_listener: mpsc::UnboundedSender<(Hash, mpsc::UnboundedSender<TopicNotification>)>,
 }
 
-fn make_gossip() -> (GossipRouter, GossipHandle) {
+fn make_gossip() -> (impl Future<Output = ()>, GossipHandle) {
 	let (message_tx, message_rx) = mpsc::unbounded();
 	let (listener_tx, listener_rx) = mpsc::unbounded();
 
 	(
-		GossipRouter {
-			incoming_messages: message_rx,
-			incoming_streams: listener_rx,
-			outgoing: Vec::new(),
-			messages: Vec::new(),
-		},
+		gossip_router(message_rx, listener_rx),
 		GossipHandle { send_message: message_tx, send_listener: listener_tx },
 	)
 }
@@ -150,18 +121,16 @@ impl NetworkService for TestNetwork {
 	fn gossip_messages_for(&self, topic: Hash) -> GossipMessageStream {
 		let (tx, rx) = mpsc::unbounded();
 		let _  = self.gossip.send_listener.unbounded_send((topic, tx));
-		GossipMessageStream::new(rx)
+		GossipMessageStream::new(rx.boxed())
+	}
+
+	fn send_message(&self, _: PeerId, _: GossipMessage) {
+		unimplemented!()
 	}
 
 	fn gossip_message(&self, topic: Hash, message: GossipMessage) {
 		let notification = TopicNotification { message: message.encode(), sender: None };
 		let _ = self.gossip.send_message.unbounded_send((topic, notification));
-	}
-
-	fn with_gossip<F: Send + 'static>(&self, with: F)
-		where F: FnOnce(&mut dyn GossipService, &mut dyn NetContext<Block>)
-	{
-		unimplemented!()
 	}
 
 	fn with_spec<F: Send + 'static>(&self, with: F)
@@ -179,7 +148,7 @@ impl NetworkService for TestNetwork {
 struct ApiData {
 	validators: Vec<ValidatorId>,
 	duties: Vec<Chain>,
-	active_parachains: Vec<ParaId>,
+	active_parachains: Vec<(ParaId, Option<(CollatorId, Retriable)>)>,
 	ingress: HashMap<ParaId, StructuredUnroutedIngress>,
 }
 
@@ -233,6 +202,8 @@ impl Core<Block> for RuntimeApi {
 }
 
 impl ApiExt<Block> for RuntimeApi {
+	type Error = sp_blockchain::Error;
+
 	fn map_api_result<F: FnOnce(&Self) -> Result<R, E>, R, E>(
 		&self,
 		_: F
@@ -246,7 +217,7 @@ impl ApiExt<Block> for RuntimeApi {
 
 	fn record_proof(&mut self) { }
 
-	fn extract_proof(&mut self) -> Option<Vec<Vec<u8>>> {
+	fn extract_proof(&mut self) -> Option<StorageProof> {
 		None
 	}
 }
@@ -281,7 +252,7 @@ impl ParachainHost<Block> for RuntimeApi {
 		_: ExecutionContext,
 		_: Option<()>,
 		_: Vec<u8>,
-	) -> ClientResult<NativeOrEncoded<Vec<ParaId>>> {
+	) -> ClientResult<NativeOrEncoded<Vec<(ParaId, Option<(CollatorId, Retriable)>)>>> {
 		Ok(NativeOrEncoded::Native(self.data.lock().active_parachains.clone()))
 	}
 
@@ -316,23 +287,32 @@ impl ParachainHost<Block> for RuntimeApi {
 		&self,
 		_at: &BlockId,
 		_: ExecutionContext,
-		id: Option<ParaId>,
+		id: Option<(ParaId, Option<BlockNumber>)>,
 		_: Vec<u8>,
 	) -> ClientResult<NativeOrEncoded<Option<StructuredUnroutedIngress>>> {
-		let id = id.unwrap();
+		let (id, _) = id.unwrap();
 		Ok(NativeOrEncoded::Native(self.data.lock().ingress.get(&id).cloned()))
+	}
+
+	fn ParachainHost_get_heads_runtime_api_impl(
+		&self,
+		_at: &BlockId,
+		_: ExecutionContext,
+		_extrinsics: Option<Vec<<Block as BlockT>::Extrinsic>>,
+		_: Vec<u8>,
+	) -> ClientResult<NativeOrEncoded<Option<Vec<CandidateReceipt>>>> {
+		Ok(NativeOrEncoded::Native(Some(Vec::new())))
 	}
 }
 
 type TestValidationNetwork = crate::validation::ValidationNetwork<
 	TestApi,
 	NeverExit,
-	TestNetwork,
 	TaskExecutor,
 >;
 
 struct Built {
-	gossip: GossipRouter,
+	gossip: Pin<Box<dyn Future<Output = ()>>>,
 	api_handle: Arc<Mutex<ApiData>>,
 	networks: Vec<TestValidationNetwork>,
 }
@@ -349,14 +329,13 @@ fn build_network(n: usize, executor: TaskExecutor) -> Built {
 		});
 
 		let message_val = crate::gossip::RegisteredMessageValidator::new_test(
-			|_hash: &_| Some(crate::gossip::Known::Leaf),
+			TestChainContext::default(),
 			Box::new(|_, _| {}),
 		);
 
 		TestValidationNetwork::new(
-			net,
-			NeverExit,
 			message_val,
+			NeverExit,
 			runtime_api.clone(),
 			executor.clone(),
 		)
@@ -365,7 +344,7 @@ fn build_network(n: usize, executor: TaskExecutor) -> Built {
 	let networks: Vec<_> = networks.collect();
 
 	Built {
-		gossip: gossip_router,
+		gossip: gossip_router.boxed(),
 		api_handle,
 		networks,
 	}
@@ -377,7 +356,7 @@ struct IngressBuilder {
 }
 
 impl IngressBuilder {
-	fn add_messages(&mut self, source: ParaId, messages: &[OutgoingMessage]) {
+	fn add_messages(&mut self, source: ParaId, messages: &[TargetedMessage]) {
 		for message in messages {
 			let target = message.target;
 			self.egress.entry((source, target)).or_insert_with(Vec::new).push(message.data.clone());
@@ -399,20 +378,44 @@ impl IngressBuilder {
 	}
 }
 
-fn make_table(data: &ApiData, local_key: &AuthorityKeyring, parent_hash: Hash) -> Arc<SharedTable> {
-	use ::av_store::Store;
+#[derive(Clone)]
+struct DummyGossipMessages;
 
-	let store = Store::new_in_memory();
+use futures::stream;
+impl av_store::ProvideGossipMessages for DummyGossipMessages {
+	fn gossip_messages_for(
+		&self,
+		_topic: Hash
+	) -> Pin<Box<dyn futures::Stream<Item = (Hash, Hash, ErasureChunk)> + Send>> {
+		stream::empty().boxed()
+	}
+
+	fn gossip_erasure_chunk(
+		&self,
+		_relay_parent: Hash,
+		_candidate_hash: Hash,
+		_erasure_root: Hash,
+		_chunk: ErasureChunk,
+	) {}
+}
+
+fn make_table(data: &ApiData, local_key: &Sr25519Keyring, parent_hash: Hash) -> Arc<SharedTable> {
+	use av_store::Store;
+	use sp_core::crypto::Pair;
+
+	let sr_pair = local_key.pair();
+	let local_key = polkadot_primitives::parachain::ValidatorPair::from(local_key.pair());
+	let store = Store::new_in_memory(DummyGossipMessages);
 	let (group_info, _) = ::polkadot_validation::make_group_info(
 		DutyRoster { validator_duty: data.duties.clone() },
 		&data.validators, // only possible as long as parachain crypto === aura crypto
-		SessionKey::from(*local_key)
+		Some(sr_pair.public().into()),
 	).unwrap();
 
 	Arc::new(SharedTable::new(
-		data.validators.as_slice(),
+		data.validators.clone(),
 		group_info,
-		Arc::new(local_key.pair()),
+		Some(Arc::new(local_key)),
 		parent_hash,
 		store,
 		None,

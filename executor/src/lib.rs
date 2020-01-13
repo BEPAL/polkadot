@@ -1,5 +1,5 @@
 // Copyright 2017 Parity Technologies (UK) Ltd.
-// This file is part of Substrate.
+// This file is part of Polkadot.
 
 // Substrate is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,11 +17,10 @@
 //! A `CodeExecutor` specialisation which uses natively compiled runtime when the wasm to be
 //! executed is equivalent to the natively compiled code.
 
-use substrate_executor::native_executor_instance;
+use sc_executor::native_executor_instance;
 
 native_executor_instance!(
     pub Executor,
     polkadot_runtime::api::dispatch,
-    polkadot_runtime::native_version,
-    polkadot_runtime::WASM_BINARY
+    polkadot_runtime::native_version
 );

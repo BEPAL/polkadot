@@ -1,5 +1,5 @@
 // Copyright 2019 Parity Technologies (UK) Ltd.
-// This file is part of Substrate.
+// This file is part of Polkadot.
 
 // Substrate is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,5 +17,5 @@
 use wasm_builder_runner::{build_current_project, WasmBuilderSource};
 
 fn main() {
-	build_current_project("wasm_binary.rs", WasmBuilderSource::Crates("1.0.3"));
+	build_current_project("wasm_binary.rs", WasmBuilderSource::Crates("1.0.8"));
 }

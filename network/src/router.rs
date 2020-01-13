@@ -23,25 +23,28 @@
 //! the `TableRouter` trait from `polkadot-validation`, which is expected to call into a shared statement table
 //! and dispatch evaluation work as necessary when new statements come in.
 
-use sr_primitives::traits::{ProvideRuntimeApi, BlakeTwo256, Hash as HashT};
+use sp_runtime::traits::{ProvideRuntimeApi, BlakeTwo256, Hash as HashT};
 use polkadot_validation::{
 	SharedTable, TableRouter, SignedStatement, GenericStatement, ParachainWork, Validated
 };
 use polkadot_primitives::{Block, Hash};
 use polkadot_primitives::parachain::{
-	Extrinsic, CandidateReceipt, ParachainHost, ValidatorIndex, Collation, PoVBlock,
+	OutgoingMessages, CandidateReceipt, ParachainHost, ValidatorIndex, Collation, PoVBlock, ErasureChunk,
 };
-use crate::gossip::{RegisteredMessageValidator, GossipMessage, GossipStatement};
+use crate::gossip::{RegisteredMessageValidator, GossipMessage, GossipStatement, ErasureChunkMessage};
 
 use futures::prelude::*;
+use futures::{task::SpawnExt, future::{ready, select}};
 use parking_lot::Mutex;
 use log::{debug, trace};
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::pin::Pin;
 
-use crate::validation::{self, SessionDataFetcher, NetworkService, Executor};
+use crate::validation::{LeafWorkDataFetcher, Executor};
+use crate::NetworkService;
 
 /// Compute the gossip topic for attestations on the given parent hash.
 pub(crate) fn attestation_topic(parent_hash: Hash) -> Hash {
@@ -51,36 +54,36 @@ pub(crate) fn attestation_topic(parent_hash: Hash) -> Hash {
 	BlakeTwo256::hash(&v[..])
 }
 
-/// Create a `Stream` of checked statements.
+/// Create a `Stream` of checked messages.
 ///
 /// The returned stream will not terminate, so it is required to make sure that the stream is
 /// dropped when it is not required anymore. Otherwise, it will stick around in memory
 /// infinitely.
 pub(crate) fn checked_statements<N: NetworkService>(network: &N, topic: Hash) ->
-	impl Stream<Item=SignedStatement, Error=()> {
+	impl Stream<Item=SignedStatement> {
 	// spin up a task in the background that processes all incoming statements
 	// validation has been done already by the gossip validator.
 	// this will block internally until the gossip messages stream is obtained.
 	network.gossip_messages_for(topic)
 		.filter_map(|msg| match msg.0 {
-			GossipMessage::Statement(s) => Some(s.signed_statement),
-			_ => None
+			GossipMessage::Statement(s) => ready(Some(s.signed_statement)),
+			_ => ready(None)
 		})
 }
 
 /// Table routing implementation.
-pub struct Router<P, E, N: NetworkService, T> {
+pub struct Router<P, E, T> {
 	table: Arc<SharedTable>,
 	attestation_topic: Hash,
-	fetcher: SessionDataFetcher<P, E, N, T>,
+	fetcher: LeafWorkDataFetcher<P, E, T>,
 	deferred_statements: Arc<Mutex<DeferredStatements>>,
 	message_validator: RegisteredMessageValidator,
 }
 
-impl<P, E, N: NetworkService, T> Router<P, E, N, T> {
+impl<P, E, T> Router<P, E, T> {
 	pub(crate) fn new(
 		table: Arc<SharedTable>,
-		fetcher: SessionDataFetcher<P, E, N, T>,
+		fetcher: LeafWorkDataFetcher<P, E, T>,
 		message_validator: RegisteredMessageValidator,
 	) -> Self {
 		let parent_hash = fetcher.parent_hash();
@@ -99,20 +102,20 @@ impl<P, E, N: NetworkService, T> Router<P, E, N, T> {
 	/// The returned stream will not terminate, so it is required to make sure that the stream is
 	/// dropped when it is not required anymore. Otherwise, it will stick around in memory
 	/// infinitely.
-	pub(crate) fn checked_statements(&self) -> impl Stream<Item=SignedStatement, Error=()> {
-		checked_statements(&**self.network(), self.attestation_topic)
+	pub(crate) fn checked_statements(&self) -> impl Stream<Item=SignedStatement> {
+		checked_statements(&*self.network(), self.attestation_topic)
 	}
 
 	fn parent_hash(&self) -> Hash {
 		self.fetcher.parent_hash()
 	}
 
-	fn network(&self) -> &Arc<N> {
+	fn network(&self) -> &RegisteredMessageValidator {
 		self.fetcher.network()
 	}
 }
 
-impl<P, E: Clone, N: NetworkService, T: Clone> Clone for Router<P, E, N, T> {
+impl<P, E: Clone, T: Clone> Clone for Router<P, E, T> {
 	fn clone(&self) -> Self {
 		Router {
 			table: self.table.clone(),
@@ -124,11 +127,10 @@ impl<P, E: Clone, N: NetworkService, T: Clone> Clone for Router<P, E, N, T> {
 	}
 }
 
-impl<P: ProvideRuntimeApi + Send + Sync + 'static, E, N, T> Router<P, E, N, T> where
-	P::Api: ParachainHost<Block>,
-	N: NetworkService,
+impl<P: ProvideRuntimeApi + Send + Sync + 'static, E, T> Router<P, E, T> where
+	P::Api: ParachainHost<Block, Error = sp_blockchain::Error>,
 	T: Clone + Executor + Send + 'static,
-	E: Future<Item=(),Error=()> + Clone + Send + 'static,
+	E: Future<Output=()> + Clone + Send + Unpin + 'static,
 {
 	/// Import a statement whose signature has been checked already.
 	pub(crate) fn import_statement(&self, statement: SignedStatement) {
@@ -172,67 +174,107 @@ impl<P: ProvideRuntimeApi + Send + Sync + 'static, E, N, T> Router<P, E, N, T> w
 
 				if let Some(work) = producer.map(|p| self.create_work(c_hash, p)) {
 					trace!(target: "validation", "driving statement work to completion");
-					let work = work.select2(self.fetcher.exit().clone()).then(|_| Ok(()));
-					self.fetcher.executor().spawn(work);
+
+					let work = select(work.boxed(), self.fetcher.exit().clone())
+						.map(drop);
+					let _ = self.fetcher.executor().spawn(work);
 				}
 			}
 		}
 	}
 
 	fn create_work<D>(&self, candidate_hash: Hash, producer: ParachainWork<D>)
-		-> impl Future<Item=(),Error=()> + Send + 'static
+		-> impl Future<Output=()> + Send + 'static
 		where
-		D: Future<Item=PoVBlock,Error=io::Error> + Send + 'static,
+		D: Future<Output=Result<PoVBlock,io::Error>> + Send + Unpin + 'static,
 	{
 		let table = self.table.clone();
 		let network = self.network().clone();
 		let knowledge = self.fetcher.knowledge().clone();
 		let attestation_topic = self.attestation_topic;
 		let parent_hash = self.parent_hash();
+		let api = self.fetcher.api().clone();
 
-		producer.prime(self.fetcher.api().clone())
-			.map(move |validated| {
-				// store the data before broadcasting statements, so other peers can fetch.
-				knowledge.lock().note_candidate(
+		async move {
+			match producer.prime(api).validate().await {
+				Ok(validated) => {
+					// store the data before broadcasting statements, so other peers can fetch.
+					knowledge.lock().note_candidate(
 					candidate_hash,
-					Some(validated.pov_block().clone()),
-					validated.extrinsic().cloned(),
-				);
+					Some(validated.0.pov_block().clone()),
+					validated.0.outgoing_messages().cloned(),
+					);
 
-
-				// propagate the statement.
-				// consider something more targeted than gossip in the future.
-				let statement = GossipStatement::new(
+					// propagate the statement.
+					// consider something more targeted than gossip in the future.
+					let statement = GossipStatement::new(
 					parent_hash,
-					table.import_validated(validated),
-				);
-				network.gossip_message(attestation_topic, statement.into());
-			})
-			.map_err(|e| debug!(target: "p_net", "Failed to produce statements: {:?}", e))
+					match table.import_validated(validated.0) {
+					None => return,
+					Some(s) => s,
+					}
+					);
+
+					network.gossip_message(attestation_topic, statement.into());
+				},
+				Err(err) => {
+					debug!(target: "p_net", "Failed to produce statements: {:?}", err);
+				}
+			}
+		}
 	}
 }
 
-impl<P: ProvideRuntimeApi + Send, E, N, T> TableRouter for Router<P, E, N, T> where
+impl<P: ProvideRuntimeApi + Send, E, T> TableRouter for Router<P, E, T> where
 	P::Api: ParachainHost<Block>,
-	N: NetworkService,
 	T: Clone + Executor + Send + 'static,
-	E: Future<Item=(),Error=()> + Clone + Send + 'static,
+	E: Future<Output=()> + Clone + Send + 'static,
 {
 	type Error = io::Error;
-	type FetchValidationProof = validation::PoVReceiver;
+	type FetchValidationProof = Pin<Box<dyn Future<Output = Result<PoVBlock, io::Error>> + Send>>;
 
-	fn local_collation(&self, collation: Collation, extrinsic: Extrinsic) {
+	// We have fetched from a collator and here the receipt should have been already formed.
+	fn local_collation(
+		&self,
+		collation: Collation,
+		receipt: CandidateReceipt,
+		outgoing: OutgoingMessages,
+		chunks: (ValidatorIndex, &[ErasureChunk])
+	) {
 		// produce a signed statement
-		let hash = collation.receipt.hash();
-		let validated = Validated::collated_local(collation.receipt, collation.pov.clone(), extrinsic.clone());
+		let hash = receipt.hash();
+		let erasure_root = receipt.erasure_root;
+		let validated = Validated::collated_local(
+			receipt,
+			collation.pov.clone(),
+			outgoing.clone(),
+		);
+
 		let statement = GossipStatement::new(
 			self.parent_hash(),
-			self.table.import_validated(validated),
+			match self.table.import_validated(validated) {
+				None => return,
+				Some(s) => s,
+			},
 		);
 
 		// give to network to make available.
-		self.fetcher.knowledge().lock().note_candidate(hash, Some(collation.pov), Some(extrinsic));
+		self.fetcher.knowledge().lock().note_candidate(hash, Some(collation.pov), Some(outgoing));
 		self.network().gossip_message(self.attestation_topic, statement.into());
+
+		for chunk in chunks.1 {
+			let relay_parent = self.parent_hash();
+			let message = ErasureChunkMessage {
+				chunk: chunk.clone(),
+				relay_parent,
+				candidate_hash: hash,
+			};
+
+			self.network().gossip_message(
+				av_store::erasure_coding_topic(relay_parent, erasure_root, chunk.index),
+				message.into()
+			);
+		}
 	}
 
 	fn fetch_pov_block(&self, candidate: &CandidateReceipt) -> Self::FetchValidationProof {
@@ -240,7 +282,7 @@ impl<P: ProvideRuntimeApi + Send, E, N, T> TableRouter for Router<P, E, N, T> wh
 	}
 }
 
-impl<P, E, N: NetworkService, T> Drop for Router<P, E, N, T> {
+impl<P, E, T> Drop for Router<P, E, T> {
 	fn drop(&mut self) {
 		let parent_hash = self.parent_hash();
 		self.network().with_spec(move |spec, _| { spec.remove_validation_session(parent_hash); });

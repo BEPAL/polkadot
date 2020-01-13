@@ -16,14 +16,13 @@
 
 //! Errors that can occur during the validation process.
 
-use runtime_primitives::RuntimeString;
-use primitives::ed25519::Public as AuthorityId;
+use polkadot_primitives::parachain::ValidatorId;
 
 /// Error type for validation
 #[derive(Debug, derive_more::Display, derive_more::From)]
 pub enum Error {
 	/// Client error
-	Client(client::error::Error),
+	Client(sp_blockchain::Error),
 	/// Consensus error
 	Consensus(consensus::error::Error),
 	#[display(fmt = "Invalid duty roster length: expected {}, got {}", expected, got)]
@@ -35,19 +34,19 @@ pub enum Error {
 	},
 	/// Local account not a validator at this block
 	#[display(fmt = "Local account ID ({:?}) not a validator at this block.", _0)]
-	NotValidator(AuthorityId),
+	NotValidator(ValidatorId),
 	/// Unexpected error checking inherents
 	#[display(fmt = "Unexpected error while checking inherents: {}", _0)]
-	InherentError(RuntimeString),
+	InherentError(inherents::Error),
 	/// Proposer destroyed before finishing proposing or evaluating
 	#[display(fmt = "Proposer destroyed before finishing proposing or evaluating")]
 	PrematureDestruction,
 	/// Timer failed
 	#[display(fmt = "Timer failed: {}", _0)]
-	Timer(tokio::timer::Error),
-	/// Unable to dispatch agreement future
-	#[display(fmt = "Unable to dispatch agreement future: {:?}", _0)]
-	Executor(futures::future::ExecuteErrorKind),
+	Timer(std::io::Error),
+	#[display(fmt = "Failed to compute deadline of now + {:?}", _0)]
+	DeadlineComputeFailure(std::time::Duration),
+	Join(tokio::task::JoinError)
 }
 
 impl std::error::Error for Error {

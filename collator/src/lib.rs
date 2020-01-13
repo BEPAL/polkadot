@@ -48,33 +48,31 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use std::pin::Pin;
 
-use futures::{future, Stream, Future, IntoFuture};
-use log::{info, warn};
+use futures::{future, Future, Stream, FutureExt, TryFutureExt, StreamExt, task::Spawn};
+use log::{warn, error};
 use client::BlockchainEvents;
-use primitives::{ed25519, Pair};
+use primitives::{Pair, Blake2Hasher};
 use polkadot_primitives::{
-	BlockId, SessionKey, Hash, Block,
+	BlockId, Hash, Block,
 	parachain::{
-		self, BlockData, DutyRoster, HeadData, ConsolidatedIngress, Message, Id as ParaId, Extrinsic,
-		PoVBlock, Status as ParachainStatus,
+		self, BlockData, DutyRoster, HeadData, ConsolidatedIngress, Message, Id as ParaId,
+		OutgoingMessages, PoVBlock, Status as ParachainStatus, ValidatorId, CollatorPair,
 	}
 };
 use polkadot_cli::{
-	Worker, IntoExit, ProvideRuntimeApi, TaskExecutor, PolkadotService, CustomConfiguration,
-	ParachainHost,
+	Worker, IntoExit, ProvideRuntimeApi, AbstractService, CustomConfiguration, ParachainHost,
 };
-use polkadot_network::validation::{SessionParams, ValidationNetwork};
-use polkadot_network::NetworkService;
-use tokio::timer::Timeout;
-use consensus_common::SelectChain;
-use aura::AuraApi;
+use polkadot_network::validation::{LeafWorkParams, ValidationNetwork};
+use polkadot_network::PolkadotProtocol;
+use polkadot_runtime::RuntimeApi;
 
 pub use polkadot_cli::VersionInfo;
 pub use polkadot_network::validation::Incoming;
 pub use polkadot_validation::SignedStatement;
 pub use polkadot_primitives::parachain::CollatorId;
-pub use substrate_network::PeerId;
+pub use sc_network::PeerId;
 
 const COLLATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -82,27 +80,28 @@ const COLLATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub trait Network: Send + Sync {
 	/// Convert the given `CollatorId` to a `PeerId`.
 	fn collator_id_to_peer_id(&self, collator_id: CollatorId) ->
-		Box<dyn Future<Item=Option<PeerId>, Error=()> + Send>;
+		Box<dyn Future<Output=Option<PeerId>> + Send>;
 
 	/// Create a `Stream` of checked statements for the given `relay_parent`.
 	///
 	/// The returned stream will not terminate, so it is required to make sure that the stream is
 	/// dropped when it is not required anymore. Otherwise, it will stick around in memory
 	/// infinitely.
-	fn checked_statements(&self, relay_parent: Hash) -> Box<dyn Stream<Item=SignedStatement, Error=()>>;
+	fn checked_statements(&self, relay_parent: Hash) -> Box<dyn Stream<Item=SignedStatement>>;
 }
 
-impl<P, E> Network for ValidationNetwork<P, E, NetworkService, TaskExecutor> where
+impl<P, E, SP> Network for ValidationNetwork<P, E, SP> where
 	P: 'static + Send + Sync,
 	E: 'static + Send + Sync,
+	SP: 'static + Spawn + Clone + Send + Sync,
 {
 	fn collator_id_to_peer_id(&self, collator_id: CollatorId) ->
-		Box<dyn Future<Item=Option<PeerId>, Error=()> + Send>
+		Box<dyn Future<Output=Option<PeerId>> + Send>
 	{
 		Box::new(Self::collator_id_to_peer_id(self, collator_id))
 	}
 
-	fn checked_statements(&self, relay_parent: Hash) -> Box<dyn Stream<Item=SignedStatement, Error=()>> {
+	fn checked_statements(&self, relay_parent: Hash) -> Box<dyn Stream<Item=SignedStatement>> {
 		Box::new(Self::checked_statements(self, relay_parent))
 	}
 }
@@ -129,13 +128,25 @@ impl<R: fmt::Display> fmt::Display for Error<R> {
 	}
 }
 
+/// The Polkadot client type.
+pub type PolkadotClient<B, E> = client::Client<B, E, Block, RuntimeApi>;
+
 /// Something that can build a `ParachainContext`.
 pub trait BuildParachainContext {
 	/// The parachain context produced by the `build` function.
 	type ParachainContext: self::ParachainContext;
 
 	/// Build the `ParachainContext`.
-	fn build(self, network: Arc<dyn Network>) -> Result<Self::ParachainContext, ()>;
+	fn build<B, E, SP>(
+		self,
+		client: Arc<PolkadotClient<B, E>>,
+		spawner: SP,
+		network: Arc<dyn Network>,
+	) -> Result<Self::ParachainContext, ()>
+		where
+			B: client_api::backend::Backend<Block, Blake2Hasher> + 'static,
+			E: client::CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static,
+			SP: Spawn + Clone + Send + Sync + 'static;
 }
 
 /// Parachain context needed for collation.
@@ -143,12 +154,12 @@ pub trait BuildParachainContext {
 /// This can be implemented through an externally attached service or a stub.
 /// This is expected to be a lightweight, shared type like an Arc.
 pub trait ParachainContext: Clone {
-	type ProduceCandidate: IntoFuture<Item=(BlockData, HeadData, Extrinsic), Error=InvalidHead>;
+	type ProduceCandidate: Future<Output = Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>>;
 
 	/// Produce a candidate, given the relay parent hash, the latest ingress queue information
 	/// and the last parachain head.
 	fn produce_candidate<I: IntoIterator<Item=(ParaId, Message)>>(
-		&self,
+		&mut self,
 		relay_parent: Hash,
 		status: ParachainStatus,
 		ingress: I,
@@ -163,94 +174,95 @@ pub trait RelayChainContext {
 
 	/// Future that resolves to the un-routed egress queues of a parachain.
 	/// The first item is the oldest.
-	type FutureEgress: IntoFuture<Item=ConsolidatedIngress, Error=Self::Error>;
+	type FutureEgress: Future<Output = Result<ConsolidatedIngress, Self::Error>>;
 
 	/// Get un-routed egress queues from a parachain to the local parachain.
 	fn unrouted_egress(&self, _id: ParaId) -> Self::FutureEgress;
 }
 
 /// Produce a candidate for the parachain, with given contexts, parent head, and signing key.
-pub fn collate<'a, R, P>(
+pub async fn collate<R, P>(
 	relay_parent: Hash,
 	local_id: ParaId,
 	parachain_status: ParachainStatus,
 	relay_context: R,
-	para_context: P,
-	key: Arc<ed25519::Pair>,
+	mut para_context: P,
+	key: Arc<CollatorPair>,
 )
-	-> impl Future<Item=parachain::Collation, Error=Error<R::Error>> + 'a
+	-> Result<(parachain::Collation, OutgoingMessages), Error<R::Error>>
 	where
 		R: RelayChainContext,
-		R::Error: 'a,
-		R::FutureEgress: 'a,
-		P: ParachainContext + 'a,
-		<P::ProduceCandidate as IntoFuture>::Future: Send,
+		P: ParachainContext,
+		P::ProduceCandidate: Send,
 {
-	let ingress = relay_context.unrouted_egress(local_id).into_future().map_err(Error::Polkadot);
-	ingress
-		.and_then(move |ingress| {
-			para_context.produce_candidate(
-				relay_parent,
-				parachain_status,
-				ingress.0.iter().flat_map(|&(id, ref msgs)| msgs.iter().cloned().map(move |msg| (id, msg)))
-			)
-				.into_future()
-				.map(move |x| (ingress, x))
-				.map_err(Error::Collator)
-		})
-		.and_then(move |(ingress, (block_data, head_data, mut extrinsic))| {
-			let block_data_hash = block_data.hash();
-			let signature = key.sign(block_data_hash.as_ref()).into();
-			let egress_queue_roots =
-				polkadot_validation::egress_roots(&mut extrinsic.outgoing_messages);
+	let ingress = relay_context.unrouted_egress(local_id).await.map_err(Error::Polkadot)?;
 
-			let receipt = parachain::CandidateReceipt {
-				parachain_index: local_id,
-				collator: key.public(),
-				signature,
-				head_data,
-				egress_queue_roots,
-				fees: 0,
-				block_data_hash,
-				upward_messages: Vec::new(),
-			};
+	let (block_data, head_data, mut outgoing) = para_context.produce_candidate(
+		relay_parent,
+		parachain_status,
+		ingress.0.iter().flat_map(|&(id, ref msgs)| msgs.iter().cloned().map(move |msg| (id, msg)))
+	).map_err(Error::Collator).await?;
 
-			Ok(parachain::Collation {
-				receipt,
-				pov: PoVBlock {
-					block_data,
-					ingress,
-				},
-			})
-		})
+	let block_data_hash = block_data.hash();
+	let signature = key.sign(block_data_hash.as_ref());
+	let egress_queue_roots =
+		polkadot_validation::egress_roots(&mut outgoing.outgoing_messages);
+
+	let info = parachain::CollationInfo {
+		parachain_index: local_id,
+		collator: key.public(),
+		signature,
+		egress_queue_roots,
+		head_data,
+		block_data_hash,
+		upward_messages: Vec::new(),
+	};
+
+	let collation = parachain::Collation {
+		info,
+		pov: PoVBlock {
+			block_data,
+			ingress,
+		},
+	};
+
+	Ok((collation, outgoing))
 }
 
 /// Polkadot-api context.
-struct ApiContext<P, E> {
-	network: Arc<ValidationNetwork<P, E, NetworkService, TaskExecutor>>,
+struct ApiContext<P, E, SP> {
+	network: Arc<ValidationNetwork<P, E, SP>>,
 	parent_hash: Hash,
-	authorities: Vec<SessionKey>,
+	validators: Vec<ValidatorId>,
 }
 
-impl<P: 'static, E: 'static> RelayChainContext for ApiContext<P, E> where
+impl<P: 'static, E: 'static, SP: 'static> RelayChainContext for ApiContext<P, E, SP> where
 	P: ProvideRuntimeApi + Send + Sync,
 	P::Api: ParachainHost<Block>,
-	E: Future<Item=(),Error=()> + Clone + Send + Sync + 'static,
+	E: futures::Future<Output=()> + Clone + Send + Sync + 'static,
+	SP: Spawn + Clone + Send + Sync
 {
 	type Error = String;
-	type FutureEgress = Box<dyn Future<Item=ConsolidatedIngress, Error=String> + Send>;
+	type FutureEgress = Pin<Box<dyn Future<Output=Result<ConsolidatedIngress, String>> + Send>>;
 
 	fn unrouted_egress(&self, _id: ParaId) -> Self::FutureEgress {
-		// TODO: https://github.com/paritytech/polkadot/issues/253
-		//
-		// Fetch ingress and accumulate all unrounted egress
-		let _session = self.network.instantiate_session(SessionParams {
-			local_session_key: None,
-			parent_hash: self.parent_hash,
-			authorities: self.authorities.clone(),
-		}).map_err(|e| format!("unable to instantiate validation session: {:?}", e));
+		let network = self.network.clone();
+		let parent_hash = self.parent_hash;
+		let authorities = self.validators.clone();
 
-		Box::new(future::ok(ConsolidatedIngress(Vec::new())))
+		async move {
+			// TODO: https://github.com/paritytech/polkadot/issues/253
+			//
+			// Fetch ingress and accumulate all unrounted egress
+			let _session = network.instantiate_leaf_work(LeafWorkParams {
+				local_session_key: None,
+				parent_hash,
+				authorities,
+			})
+				.map_err(|e| format!("unable to instantiate validation session: {:?}", e));
+
+			Ok(ConsolidatedIngress(Vec::new()))
+		}.boxed()
 	}
 }
 
@@ -258,11 +270,11 @@ struct CollationNode<P, E> {
 	build_parachain_context: P,
 	exit: E,
 	para_id: ParaId,
-	key: Arc<ed25519::Pair>,
+	key: Arc<CollatorPair>,
 }
 
 impl<P, E> IntoExit for CollationNode<P, E> where
-	E: Future<Item=(),Error=()> + Send + 'static
+	E: futures::Future<Output=()> + Unpin + Send + 'static
 {
 	type Exit = E;
 	fn into_exit(self) -> Self::Exit {
@@ -273,22 +285,34 @@ impl<P, E> IntoExit for CollationNode<P, E> where
 impl<P, E> Worker for CollationNode<P, E> where
 	P: BuildParachainContext + Send + 'static,
 	P::ParachainContext: Send + 'static,
-	<<P::ParachainContext as ParachainContext>::ProduceCandidate as IntoFuture>::Future: Send + 'static,
-	E: Future<Item=(), Error=()> + Clone + Send + Sync + 'static,
+	<P::ParachainContext as ParachainContext>::ProduceCandidate: Send + 'static,
+	E: futures::Future<Output=()> + Clone + Unpin + Send + Sync + 'static,
 {
-	type Work = Box<dyn Future<Item=(), Error=()> + Send>;
+	type Work = Box<dyn Future<Output=()> + Unpin + Send>;
 
 	fn configuration(&self) -> CustomConfiguration {
 		let mut config = CustomConfiguration::default();
 		config.collating_for = Some((
 			self.key.public(),
-			self.para_id.clone(),
+			self.para_id,
 		));
 		config
 	}
 
-	fn work<S>(self, service: &S, task_executor: TaskExecutor) -> Self::Work where
-		S: PolkadotService,
+	fn work<S, SC, B, CE, SP>(self, service: &S, spawner: SP) -> Self::Work
+	where
+		S: AbstractService<
+			Block = Block,
+			RuntimeApi = RuntimeApi,
+			Backend = B,
+			SelectChain = SC,
+			NetworkSpecialization = PolkadotProtocol,
+			CallExecutor = CE,
+		>,
+		SC: polkadot_service::SelectChain<Block> + 'static,
+		B: client_api::backend::Backend<Block, Blake2Hasher> + 'static,
+		CE: client::CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static,
+		SP: Spawn + Clone + Send + Sync + 'static,
 	{
 		let CollationNode { build_parachain_context, exit, para_id, key } = self;
 		let client = service.client();
@@ -297,41 +321,54 @@ impl<P, E> Worker for CollationNode<P, E> where
 		let select_chain = if let Some(select_chain) = service.select_chain() {
 			select_chain
 		} else {
-			info!("The node cannot work because it can't select chain.");
-			return Box::new(future::err(()));
+			error!("The node cannot work because it can't select chain.");
+			return Box::new(future::ready(()));
+		};
+
+		let is_known = move |block_hash: &Hash| {
+			use consensus_common::BlockStatus;
+			use polkadot_network::gossip::Known;
+
+			match known_oracle.block_status(&BlockId::hash(*block_hash)) {
+				Err(_) | Ok(BlockStatus::Unknown) | Ok(BlockStatus::Queued) => None,
+				Ok(BlockStatus::KnownBad) => Some(Known::Bad),
+				Ok(BlockStatus::InChainWithState) | Ok(BlockStatus::InChainPruned) =>
+					match select_chain.leaves() {
+						Err(_) => None,
+						Ok(leaves) => if leaves.contains(block_hash) {
+							Some(Known::Leaf)
+						} else {
+							Some(Known::Old)
+						},
+					}
+			}
 		};
 
 		let message_validator = polkadot_network::gossip::register_validator(
 			network.clone(),
-			move |block_hash: &Hash| {
-				use client::BlockStatus;
-				use polkadot_network::gossip::Known;
-
-				match known_oracle.block_status(&BlockId::hash(*block_hash)) {
-					Err(_) | Ok(BlockStatus::Unknown) | Ok(BlockStatus::Queued) => None,
-					Ok(BlockStatus::KnownBad) => Some(Known::Bad),
-					Ok(BlockStatus::InChainWithState) | Ok(BlockStatus::InChainPruned) =>
-						match select_chain.leaves() {
-							Err(_) => None,
-							Ok(leaves) => if leaves.contains(block_hash) {
-								Some(Known::Leaf)
-							} else {
-								Some(Known::Old)
-							},
-						}
-				}
-			},
+			(is_known, client.clone()),
+			&spawner
 		);
 
 		let validation_network = Arc::new(ValidationNetwork::new(
-			network.clone(),
-			exit.clone(),
 			message_validator,
+			exit.clone(),
 			client.clone(),
-			task_executor,
+			spawner.clone(),
 		));
 
-		let parachain_context = build_parachain_context.build(validation_network.clone()).unwrap();
+		let parachain_context = match build_parachain_context.build(
+			client.clone(),
+			spawner,
+			validation_network.clone(),
+		) {
+			Ok(ctx) => ctx,
+			Err(()) => {
+				error!("Could not build the parachain context!");
+				return Box::new(future::ready(()))
+			}
+		};
+
 		let inner_exit = exit.clone();
 		let work = client.import_notification_stream()
 			.for_each(move |notification| {
@@ -339,7 +376,7 @@ impl<P, E> Worker for CollationNode<P, E> where
 					($e:expr) => {
 						match $e {
 							Ok(x) => x,
-							Err(e) => return future::Either::A(future::err(Error::Polkadot(
+							Err(e) => return future::Either::Left(future::err(Error::Polkadot(
 								format!("{:?}", e)
 							))),
 						}
@@ -354,26 +391,27 @@ impl<P, E> Worker for CollationNode<P, E> where
 				let key = key.clone();
 				let parachain_context = parachain_context.clone();
 				let validation_network = validation_network.clone();
+				let inner_exit_2 = inner_exit.clone();
 
-				let work = future::lazy(move || {
+				let work = future::lazy(move |_| {
 					let api = client.runtime_api();
 					let status = match try_fr!(api.parachain_status(&id, para_id)) {
 						Some(status) => status,
-						None => return future::Either::A(future::ok(())),
+						None => return future::Either::Left(future::ok(())),
 					};
 
-					let authorities = try_fr!(api.authorities(&id));
+					let validators = try_fr!(api.validators(&id));
 
 					let targets = compute_targets(
 						para_id,
-						authorities.as_slice(),
+						validators.as_slice(),
 						try_fr!(api.duty_roster(&id)),
 					);
 
 					let context = ApiContext {
 						network: validation_network,
 						parent_hash: relay_parent,
-						authorities,
+						validators,
 					};
 
 					let collation_work = collate(
@@ -383,36 +421,53 @@ impl<P, E> Worker for CollationNode<P, E> where
 						context,
 						parachain_context,
 						key,
-					).map(move |collation| {
-						network.with_spec(move |spec, ctx| spec.add_local_collation(
-							ctx,
-							relay_parent,
-							targets,
-							collation,
-						));
+					).map_ok(move |(collation, outgoing)| {
+						network.with_spec(move |spec, ctx| {
+							let res = spec.add_local_collation(
+								ctx,
+								relay_parent,
+								targets,
+								collation,
+								outgoing,
+							);
+
+							let exit = inner_exit_2.clone();
+							tokio::spawn(future::select(res.boxed(), exit).map(drop));
+						})
 					});
 
-					future::Either::B(collation_work)
-				});
-				let deadlined = Timeout::new(work, COLLATION_TIMEOUT);
-				let silenced = deadlined.then(|res| match res {
-					Ok(()) => Ok(()),
-					Err(_) => {
-						warn!("Collation failure: timeout");
-						Ok(())
-					}
+					future::Either::Right(collation_work)
 				});
 
-				tokio::spawn(silenced.select(inner_exit.clone()).then(|_| Ok(())));
-				Ok(())
+				let deadlined = future::select(
+					work,
+					futures_timer::Delay::new(COLLATION_TIMEOUT)
+				);
+
+				let silenced = deadlined
+					.map(|either| {
+						if let future::Either::Right(_) = either {
+							warn!("Collation failure: timeout");
+						}
+					});
+
+				let future = future::select(
+					silenced,
+					inner_exit.clone()
+				).map(drop);
+
+				tokio::spawn(future);
+				future::ready(())
 			});
 
-		let work_and_exit = work.select(exit).then(|_| Ok(()));
-		Box::new(work_and_exit) as Box<_>
+		let work_and_exit = future::select(work, exit)
+			.map(|_| ());
+
+		Box::new(work_and_exit)
 	}
 }
 
-fn compute_targets(para_id: ParaId, session_keys: &[SessionKey], roster: DutyRoster) -> HashSet<SessionKey> {
+fn compute_targets(para_id: ParaId, session_keys: &[ValidatorId], roster: DutyRoster) -> HashSet<ValidatorId> {
 	use polkadot_primitives::parachain::Chain;
 
 	roster.validator_duty.iter().enumerate()
@@ -427,31 +482,27 @@ fn compute_targets(para_id: ParaId, session_keys: &[SessionKey], roster: DutyRos
 ///
 /// Provide a future which resolves when the node should exit.
 /// This function blocks until done.
-pub fn run_collator<P, E, I, ArgT>(
+pub fn run_collator<P, E>(
 	build_parachain_context: P,
 	para_id: ParaId,
 	exit: E,
-	key: Arc<ed25519::Pair>,
-	args: I,
+	key: Arc<CollatorPair>,
 	version: VersionInfo,
 ) -> polkadot_cli::error::Result<()> where
 	P: BuildParachainContext + Send + 'static,
 	P::ParachainContext: Send + 'static,
-	<<P::ParachainContext as ParachainContext>::ProduceCandidate as IntoFuture>::Future: Send + 'static,
-	E: IntoFuture<Item=(), Error=()>,
-	E::Future: Send + Clone + Sync + 'static,
-	I: IntoIterator<Item=ArgT>,
-	ArgT: Into<std::ffi::OsString> + Clone,
+	<P::ParachainContext as ParachainContext>::ProduceCandidate: Send + 'static,
+	E: futures::Future<Output = ()> + Unpin + Send + Clone + Sync + 'static,
 {
-	let node_logic = CollationNode { build_parachain_context, exit: exit.into_future(), para_id, key };
-	polkadot_cli::run(args, node_logic, version)
+	let node_logic = CollationNode { build_parachain_context, exit, para_id, key };
+	polkadot_cli::run(node_logic, version)
 }
 
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
-	use polkadot_primitives::parachain::{OutgoingMessage, FeeSchedule};
-	use keyring::AuthorityKeyring;
+	use polkadot_primitives::parachain::{TargetedMessage, FeeSchedule};
+	use keyring::Sr25519Keyring;
 	use super::*;
 
 	#[derive(Default, Clone)]
@@ -461,12 +512,12 @@ mod tests {
 
 	impl RelayChainContext for DummyRelayChainContext {
 		type Error = ();
-		type FutureEgress = Box<dyn Future<Item=ConsolidatedIngress,Error=()>>;
+		type FutureEgress = Box<dyn Future<Output=Result<ConsolidatedIngress,()>> + Unpin>;
 
 		fn unrouted_egress(&self, para_id: ParaId) -> Self::FutureEgress {
 			match self.ingress.get(&para_id) {
 				Some(ingress) => Box::new(future::ok(ingress.clone())),
-				None => Box::new(future::empty()),
+				None => Box::new(future::pending()),
 			}
 		}
 	}
@@ -475,20 +526,20 @@ mod tests {
 	struct DummyParachainContext;
 
 	impl ParachainContext for DummyParachainContext {
-		type ProduceCandidate = Result<(BlockData, HeadData, Extrinsic), InvalidHead>;
+		type ProduceCandidate = future::Ready<Result<(BlockData, HeadData, OutgoingMessages), InvalidHead>>;
 
 		fn produce_candidate<I: IntoIterator<Item=(ParaId, Message)>>(
-			&self,
+			&mut self,
 			_relay_parent: Hash,
 			_status: ParachainStatus,
 			ingress: I,
-		) -> Result<(BlockData, HeadData, Extrinsic), InvalidHead> {
+		) -> Self::ProduceCandidate {
 			// send messages right back.
-			Ok((
+			future::ok((
 				BlockData(vec![1, 2, 3, 4, 5,]),
 				HeadData(vec![9, 9, 9]),
-				Extrinsic {
-					outgoing_messages: ingress.into_iter().map(|(id, msg)| OutgoingMessage {
+				OutgoingMessages {
+					outgoing_messages: ingress.into_iter().map(|(id, msg)| TargetedMessage {
 						target: id,
 						data: msg.0,
 					}).collect(),
@@ -528,7 +579,7 @@ mod tests {
 			(a, messages_from_a),
 		]));
 
-		let collation = collate(
+		let future = collate(
 			Default::default(),
 			id,
 			ParachainStatus {
@@ -541,11 +592,13 @@ mod tests {
 			},
 			context.clone(),
 			DummyParachainContext,
-			AuthorityKeyring::Alice.pair().into(),
-		).wait().unwrap();
+			Arc::new(Sr25519Keyring::Alice.pair().into()),
+		);
+
+		let collation = futures::executor::block_on(future).unwrap().0;
 
 		// ascending order by root.
-		assert_eq!(collation.receipt.egress_queue_roots, vec![(a, root_a), (b, root_b)]);
+		assert_eq!(collation.info.egress_queue_roots, vec![(a, root_a), (b, root_b)]);
 	}
 }
 
