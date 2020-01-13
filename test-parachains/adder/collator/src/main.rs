@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -21,17 +21,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use adder::{HeadData as AdderHead, BlockData as AdderBody};
-use sp_core::{Pair, Blake2Hasher};
-use parachain::codec::{Encode, Decode};
+use sp_core::Pair;
+use codec::{Encode, Decode};
 use primitives::{
-	Hash, Block,
+	Hash,
 	parachain::{
 		HeadData, BlockData, Id as ParaId, Message, OutgoingMessages, Status as ParachainStatus,
 	},
 };
-use collator::{InvalidHead, ParachainContext, VersionInfo, Network, BuildParachainContext};
+use collator::{
+	InvalidHead, ParachainContext, Network, BuildParachainContext, load_spec, Configuration,
+};
 use parking_lot::Mutex;
-use futures::{future::{Ready, ok, err}, task::Spawn};
+use futures::future::{Ready, ok, err};
 
 const GENESIS: AdderHead = AdderHead {
 	number: 0,
@@ -106,17 +108,12 @@ impl ParachainContext for AdderContext {
 impl BuildParachainContext for AdderContext {
 	type ParachainContext = Self;
 
-	fn build<B, E, SP>(
+	fn build<B, E, R, SP, Extrinsic>(
 		self,
-		_: Arc<collator::PolkadotClient<B, E>>,
+		_: Arc<collator::PolkadotClient<B, E, R>>,
 		_: SP,
 		network: Arc<dyn Network>,
-	) -> Result<Self::ParachainContext, ()>
-		where
-			B: client_api::backend::Backend<Block, Blake2Hasher> + 'static,
-			E: client::CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static,
-			SP: Spawn + Clone + Send + Sync + 'static,
-	{
+	) -> Result<Self::ParachainContext, ()> {
 		Ok(Self { _network: Some(network), ..self })
 	}
 }
@@ -153,20 +150,12 @@ fn main() {
 		_network: None,
 	};
 
-	let res = ::collator::run_collator(
+	let res = collator::run_collator(
 		context,
 		id,
 		exit,
 		key,
-		VersionInfo {
-			name: "<unknown>",
-			version: "<unknown>",
-			commit: "<unknown>",
-			executable_name: "adder-collator",
-			description: "collator for adder parachain",
-			author: "parity technologies",
-			support_url: "https://github.com/paritytech/polkadot/issues/new",
-		}
+		Configuration::default_with_spec_and_base_path(load_spec("dev").unwrap().unwrap(), None),
 	);
 
 	if let Err(e) = res {

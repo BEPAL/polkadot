@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -22,7 +22,8 @@
 use polkadot_primitives::{Hash, parachain::{ValidatorId}};
 use crate::collator_pool::Role;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use wasm_timer::Instant;
 
 const LIVE_FOR: Duration = Duration::from_secs(60 * 5);
 

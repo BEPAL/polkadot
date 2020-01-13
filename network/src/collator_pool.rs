@@ -1,4 +1,4 @@
-// Copyright 2018 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -23,7 +23,8 @@ use sc_network::PeerId;
 use futures::channel::oneshot;
 
 use std::collections::hash_map::{HashMap, Entry};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use wasm_timer::Instant;
 
 const COLLATION_LIFETIME: Duration = Duration::from_secs(60 * 5);
 

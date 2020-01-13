@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -27,17 +27,9 @@ pub mod currency {
 /// Time and blocks.
 pub mod time {
 	use primitives::{Moment, BlockNumber};
-	// Kusama & mainnet
 	pub const MILLISECS_PER_BLOCK: Moment = 6000;
-	// Testnet
-//	pub const MILLISECS_PER_BLOCK: Moment = 1000;
 	pub const SLOT_DURATION: Moment = MILLISECS_PER_BLOCK;
-	// Kusama
-	pub const EPOCH_DURATION_IN_BLOCKS: BlockNumber = 1 * HOURS;
-	// Mainnet
-//	pub const EPOCH_DURATION_IN_BLOCKS: BlockNumber = 4 * HOURS;
-	// Testnet
-//	pub const EPOCH_DURATION_IN_BLOCKS: BlockNumber = 10 * MINUTES;
+	pub const EPOCH_DURATION_IN_BLOCKS: BlockNumber = 4 * HOURS;
 
 	// These time units are defined in number of blocks.
 	pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);

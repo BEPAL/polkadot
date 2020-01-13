@@ -1,4 +1,4 @@
-// Copyright 2017-2018 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -305,6 +305,7 @@ mod tests {
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
+		type ModuleToIndex = ();
 	}
 
 	parameter_types! {
@@ -316,6 +317,7 @@ mod tests {
 	impl balances::Trait for Test {
 		type Balance = u64;
 		type OnFreeBalanceZero = ();
+		type OnReapAccount = System;
 		type OnNewAccount = ();
 		type Event = ();
 		type DustRemoval = ();
@@ -334,6 +336,7 @@ mod tests {
 		type Currency = Balances;
 		type Prefix = Prefix;
 	}
+	type System = system::Module<Test>;
 	type Balances = balances::Module<Test>;
 	type Claims = Module<Test>;
 
@@ -407,7 +410,7 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_noop!(
 				Claims::mint_claim(Origin::signed(42), eth(&bob()), 200, None),
-				"RequireRootOrigin"
+				sp_runtime::traits::BadOrigin,
 			);
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_noop!(
@@ -426,7 +429,7 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_noop!(
 				Claims::mint_claim(Origin::signed(42), eth(&bob()), 200, Some((50, 10, 1))),
-				"RequireRootOrigin"
+				sp_runtime::traits::BadOrigin,
 			);
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_noop!(
@@ -446,7 +449,7 @@ mod tests {
 			assert_eq!(Balances::free_balance(&42), 0);
 			assert_err!(
 				Claims::claim(Origin::signed(42), 42, sig(&alice(), &42u64.encode())),
-				"RequireNoOrigin",
+				sp_runtime::traits::BadOrigin,
 			);
 		});
 	}

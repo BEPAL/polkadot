@@ -1,4 +1,4 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
+// Copyright 2017-2020 Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -501,12 +501,13 @@ mod tests {
 
 	use std::{collections::HashMap, cell::RefCell};
 	use frame_support::{impl_outer_origin, assert_ok, assert_noop, parameter_types};
+	use frame_support::traits::Contains;
 	use sp_core::H256;
 	use primitives::parachain::{Info as ParaInfo, Id as ParaId};
 	// The testing primitives are very useful for avoiding having to work with signatures
 	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are requried.
 	use sp_runtime::{
-		Perbill, Permill, testing::Header,
+		Perbill, Permill, Percent, testing::Header, DispatchResult,
 		traits::{BlakeTwo256, OnInitialize, OnFinalize, IdentityLookup},
 	};
 	use crate::registrar::Registrar;
@@ -542,6 +543,7 @@ mod tests {
 		type MaximumBlockLength = MaximumBlockLength;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
+		type ModuleToIndex = ();
 	}
 	parameter_types! {
 		pub const ExistentialDeposit: u64 = 0;
@@ -553,6 +555,7 @@ mod tests {
 	impl balances::Trait for Test {
 		type Balance = u64;
 		type OnFreeBalanceZero = ();
+		type OnReapAccount = System;
 		type OnNewAccount = ();
 		type Event = ();
 		type DustRemoval = ();
@@ -567,6 +570,15 @@ mod tests {
 		pub const ProposalBondMinimum: u64 = 1;
 		pub const SpendPeriod: u64 = 2;
 		pub const Burn: Permill = Permill::from_percent(50);
+		pub const TipCountdown: u64 = 1;
+		pub const TipFindersFee: Percent = Percent::from_percent(20);
+		pub const TipReportDepositBase: u64 = 1;
+		pub const TipReportDepositPerByte: u64 = 1;
+	}
+	pub struct Nobody;
+	impl Contains<u64> for Nobody {
+		fn contains(_: &u64) -> bool { false }
+		fn sorted_members() -> Vec<u64> { vec![] }
 	}
 	impl treasury::Trait for Test {
 		type Currency = balances::Module<Test>;
@@ -578,6 +590,11 @@ mod tests {
 		type ProposalBondMinimum = ProposalBondMinimum;
 		type SpendPeriod = SpendPeriod;
 		type Burn = Burn;
+		type Tippers = Nobody;
+		type TipCountdown = TipCountdown;
+		type TipFindersFee = TipFindersFee;
+		type TipReportDepositBase = TipReportDepositBase;
+		type TipReportDepositPerByte = TipReportDepositPerByte;
 	}
 
 	thread_local! {
@@ -594,12 +611,13 @@ mod tests {
 				(*p.borrow() - 1).into()
 			})
 		}
+
 		fn register_para(
 			id: ParaId,
 			_info: ParaInfo,
 			code: Vec<u8>,
 			initial_head_data: Vec<u8>
-		) -> Result<(), &'static str> {
+		) -> DispatchResult {
 			PARACHAINS.with(|p| {
 				if p.borrow().contains_key(&id.into()) {
 					panic!("ID already exists")
@@ -608,7 +626,8 @@ mod tests {
 				Ok(())
 			})
 		}
-		fn deregister_para(id: ParaId) -> Result<(), &'static str> {
+
+		fn deregister_para(id: ParaId) -> DispatchResult {
 			PARACHAINS.with(|p| {
 				if !p.borrow().contains_key(&id.into()) {
 					panic!("ID doesn't exist")
@@ -650,6 +669,7 @@ mod tests {
 	type Treasury = treasury::Module<Test>;
 	type Crowdfund = Module<Test>;
 	type RandomnessCollectiveFlip = randomness_collective_flip::Module<Test>;
+	use balances::Error as BalancesError;
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mockup.
@@ -730,7 +750,7 @@ mod tests {
 			assert_noop!(Crowdfund::create(Origin::signed(1), 1000, 1, 5, 9), "last slot cannot be more then 3 more than first slot");
 
 			// Cannot create a crowdfund without some deposit funds
-			assert_noop!(Crowdfund::create(Origin::signed(1337), 1000, 1, 3, 9), "too few free funds in account");
+			assert_noop!(Crowdfund::create(Origin::signed(1337), 1000, 1, 3, 9), BalancesError::<Test, _>::InsufficientBalance);
 		});
 	}
 
